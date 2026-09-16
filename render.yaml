@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: autoviewer-platform
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install
+    startCommand: node autoviewer.js
+    healthCheckPath: /health
+    nodeVersion: 20
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: PUBLIC_URL
+        sync: false
+    disk:
+      name: session-data
+      mountPath: /opt/render/project/src/session
+      sizeGB: 1
