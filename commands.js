@@ -229,26 +229,13 @@ async function handleOwnerCommand(sock, body, m, jid) {
     if (!isOwner && !listedAdmin && !publicMode) {
         const canMod = isGroup && MOD_CMDS.has(cmd) && await isGroupAdmin(sock, jid, senderNum);
         if (!canMod) {
-            // Groups get a denial card; DMs from strangers stay silent so
-            // the bot never reveals itself to randos.
-            if (isGroup) await reply(
-`*⛔ ${fb('ACCESS DENIED')}
-${DIV}
-\`.${cmd}\` — admins only.
-
-_The linked phone or a listed
-admin can use this._
-${DIV}${FOOT}`);
+            // Unauthorized commands are ignored silently everywhere —
+            // the bot never reveals itself or its command list to randos.
             return;
         }
     }
     // The admin list itself is owner-only, no exceptions.
     if (!isOwner && cmd === 'admin') {
-        if (isGroup) await reply(
-`*⛔ ${fb('ACCESS DENIED')}
-${DIV}
-\`.admin\` — linked phone only.
-${DIV}${FOOT}`);
         return;
     }
 
@@ -366,11 +353,7 @@ ${DIV}${FOOT}`);
 
         case 'mode': {
             // Access mode — owner-only, enforced here AND in the auth gate.
-            if (!isOwner) return reply(
-`*⛔ ${fb('ACCESS DENIED')}
-${DIV}
-\`.mode\` — linked phone only.
-${DIV}${FOOT}`);
+            if (!isOwner) return;
             const v = (parts[0] || '').toLowerCase();
             if (v !== 'public' && v !== 'self') return reply(
 `*👑 ${fb('ACCESS MODE')}
