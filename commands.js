@@ -222,7 +222,6 @@ async function handleOwnerCommand(sock, body, m, jid) {
     const MOD_CMDS = new Set(['kick', 'promote', 'demote', 'mute', 'unmute', 'tagall']);
     if (MOD_CMDS.has(cmd)) {
         if (userSettings.groupAdmin === false) {
-            if (isGroup) await reply(`*⚠️ Group admin/moderator features are currently disabled in bot settings.*`);
             return;
         }
     }
@@ -326,11 +325,7 @@ ${DIV}${FOOT}`);
         case 'groupadmin':
         case 'chatai': {
             const v = (parts[0] || '').toLowerCase();
-            if (v !== 'on' && v !== 'off') return reply(
-`*⚠️ ${fb('USAGE')}
-${DIV}
-\`.${cmd} on\`  or  \`.${cmd} off\`
-${DIV}${FOOT}`);
+            if (v !== 'on' && v !== 'off') return;
             const keyMap = {
                 autostatus: 'autostatus',
                 antidelete: 'antidelete',
@@ -377,11 +372,7 @@ ${DIV}${FOOT}`);
 
         case 'statusreact': {
             const v = (parts[0] || '').toLowerCase();
-            if (v !== 'on' && v !== 'off') return reply(
-`*⚠️ ${fb('USAGE')}
-${DIV}
-\`.statusreact on\`  or  \`.statusreact off\`
-${DIV}${FOOT}`);
+            if (v !== 'on' && v !== 'off') return;
             apply({ statusReact: v === 'on' },
 `${v === 'on' ? '✅' : '⛔'} *${fb('STATUS REACT')} ${fb(v.toUpperCase())}*
 ${DIV}
@@ -397,12 +388,7 @@ ${DIV}${FOOT}`);
             const list = Array.isArray(userSettings[cmd]) ? [...userSettings[cmd]] : [];
             const head = cmd === 'allow' ? '💬 ' + fb('ALLOW LIST') : '🚫 ' + fb('BLOCK LIST');
             if (action === 'add') {
-                if (num.length < 7) return reply(
-`*⚠️ ${fb('USAGE')}
-${DIV}
-\`.${cmd} add <number>\`
-_e.g._ \`.${cmd} add 0244123456\`
-${DIV}${FOOT}`);
+                if (num.length < 7) return;
                 if (!list.some(n => numMatch(n, num))) list.push(num);
                 apply({ [cmd]: list },
 `*➕ ${head}*
@@ -411,21 +397,14 @@ ${DIV}
 Total: *${list.length}* contact${list.length === 1 ? '' : 's'}
 ${DIV}${FOOT}`);
             } else if (action === 'del' || action === 'remove') {
-                if (num.length < 7) return reply(
-`*⚠️ ${fb('USAGE')}
-${DIV}
-\`.${cmd} del <number>\`
-${DIV}${FOOT}`);
+                if (num.length < 7) return;
                 const next = list.filter(n => !numMatch(n, num));
-                apply({ [cmd]: next }, next.length < list.length ?
+                if (next.length === list.length) break;
+                apply({ [cmd]: next },
 `*➖ ${head}*
 ${DIV}
 \`+${num}\` removed.
 Total: *${next.length}* contact${next.length === 1 ? '' : 's'}
-${DIV}${FOOT}` :
-`*⚠️ ${head}*
-${DIV}
-\`+${num}\` wasn't on the list.
 ${DIV}${FOOT}`);
             } else {
                 await reply(
@@ -453,12 +432,7 @@ ${DIV}${FOOT}`);
 ${DIV}
 Reset to default ✅
 ${DIV}${FOOT}`);
-            if (text.length > 300) return reply(
-`*⚠️ ${fb('PERSONA')}
-${DIV}
-Too long: *${text.length}*/300 characters.
-Shorten it and try again.
-${DIV}${FOOT}`);
+            if (text.length > 300) return;
             apply({ persona: text },
 `*🎭 ${fb('PERSONA SET')} ✅
 ${DIV}
@@ -511,12 +485,7 @@ ${DIV}
 to your chats.
 ${DIV}${FOOT}`);
             } catch (e) {
-                await reply(
-`*⚠️ ${fb('SAVE FAILED')}
-${DIV}
-${e.message}
-_The status may have expired._
-${DIV}${FOOT}`);
+                console.error('[Cmd] status save failed:', e.message);
             }
             break;
         }
@@ -585,13 +554,7 @@ ${DIV}${FOOT}` }).catch(() => {});
             } catch (e) {
                 // Never leak bot output into a contact's chat — DM errors
                 // go to the owner's self-chat, group errors reply inline.
-                const errText =
-`*⚠️ ${fb('REVEAL FAILED')}
-${DIV}
-${e.message}
-${DIV}${FOOT}`;
-                if (isGroup) await reply(errText);
-                else await sock.sendMessage(dest, { text: errText }).catch(() => {});
+                console.error('[Cmd] reveal failed:', e.message);
             }
             break;
         }
@@ -612,13 +575,7 @@ ${DIV}${FOOT}`);
             }
             const num = (parts[1] || '').replace(/\D/g, '');
             if ((action !== 'add' && action !== 'del') || !num || num.length < 6) {
-                await reply(
-`*⚠️ ${fb('USAGE')}
-${DIV}
-\`.admin add <number>\`
-\`.admin del <number>\`
-\`.admin list\`
-${DIV}${FOOT}`);
+                // silent
                 break;
             }
             const next = action === 'add'
@@ -640,12 +597,7 @@ ${DIV}${FOOT}`);
         case 'promote':
         case 'demote': {
             if (!(await botIsGroupAdmin(sock, jid))) {
-                await reply(
-`*⚠️ ${fb('I NEED ADMIN')}
-${DIV}
-_Make me a group admin first —_
-_I can't ${cmd} without it._
-${DIV}${FOOT}`);
+                // silent
                 break;
             }
             const ctxInfo = m.message?.extendedTextMessage?.contextInfo;
@@ -660,12 +612,7 @@ ${DIV}${FOOT}`);
             }
             targetJids = targetJids.map(j => j.includes('@') ? j : `${j}@s.whatsapp.net`);
             if (!targetJids.length) {
-                await reply(
-`*⚠️ ${fb('USAGE')}
-${DIV}
-\`.${cmd} @user\` — _mention, reply,
-or type the number._
-${DIV}${FOOT}`);
+                // silent
                 break;
             }
             try {
@@ -676,11 +623,7 @@ ${DIV}
 ${targetJids.map(j => `\`+${j.split('@')[0]}\``).join('\n')}
 ${DIV}${FOOT}`);
             } catch (e) {
-                await reply(
-`*⚠️ ${fb('ACTION FAILED')}
-${DIV}
-${e.message}
-${DIV}${FOOT}`);
+                console.error(`[Cmd] ${cmd} failed:`, e.message);
             }
             break;
         }
@@ -688,12 +631,7 @@ ${DIV}${FOOT}`);
         case 'mute':
         case 'unmute': {
             if (!(await botIsGroupAdmin(sock, jid))) {
-                await reply(
-`*⚠️ ${fb('I NEED ADMIN')}
-${DIV}
-_Make me a group admin first —_
-_I can't change group settings._
-${DIV}${FOOT}`);
+                // silent
                 break;
             }
             try {
@@ -704,11 +642,7 @@ ${DIV}
 ${cmd === 'mute' ? '_Only admins can send now._' : '_Everyone can send again._'}
 ${DIV}${FOOT}`);
             } catch (e) {
-                await reply(
-`*⚠️ ${fb('ACTION FAILED')}
-${DIV}
-${e.message}
-${DIV}${FOOT}`);
+                console.error(`[Cmd] ${cmd} failed:`, e.message);
             }
             break;
         }
