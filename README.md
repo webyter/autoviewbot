@@ -8,6 +8,7 @@ Production-ready WhatsApp automation with iOS Glass UI.
 - 🤖 **ChatAI**: DM automation via Groq
 - 📱 **Link Method**: QR Code or Pairing Code
 - 👥 **Multi-User**: Independent instances for everyone
+- 👑 **Admin**: Set `ADMIN_USERNAMES` (comma separated) in your environment — matching accounts are granted platform admin at registration, and existing accounts are promoted on restart
 
 ## Hosting on Render
 To host this platform on Render, follow these steps:
