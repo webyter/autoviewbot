@@ -354,7 +354,7 @@ ${DIV}${FOOT}`);
                 antilink: 'antilink',
                 groupadmin: 'groupAdmin',
                 chatai: 'chatai',
-                autoreply: 'chatai'
+                autoreply: 'autoreply'
             };
             const settingKey = keyMap[cmd] || cmd;
             apply({ [settingKey]: v === 'on' },
