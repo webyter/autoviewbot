@@ -1,7 +1,7 @@
 {
   "name": "autoviewer",
   "version": "1.0.0",
-  "description": "AutoViewer — Multi-user WhatsApp automation platform with per-user settings, QR linking, auto-status, and ChatAI.",
+  "description": "AutoViewer \u2014 Multi-user WhatsApp automation platform with per-user settings, QR linking, auto-status, and ChatAI.",
   "main": "autoviewer.js",
   "scripts": {
     "start": "node autoviewer.js"
@@ -24,12 +24,12 @@
   ],
   "license": "Apache-2.0",
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc13",
-    "axios": "^1.17.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "axios": "^1.20.0",
     "bcrypt": "^6.0.0",
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
-    "express-rate-limit": "^8.6.1",
+    "express-rate-limit": "^8.7.0",
     "express-session": "^1.19.0",
     "https-proxy-agent": "^9.1.0",
     "pino": "^9.14.0",
