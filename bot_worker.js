@@ -342,7 +342,7 @@ const _alertedStatus = new Map();  // status content signature -> ts (same statu
 const STATUS_ALERT_TTL = 60 * 60 * 1000; // dedup window for one status' delete alert
 const _reactedStatus = new Map();  // status content signature -> ts (one reaction per unique status)
 const STATUS_REACT_TTL = 60 * 60 * 1000; // dedup window for one status reaction
-const antilinkWarns = new Map(); // anti-link: "jid:sender" -> warn count (1=warned, 2=kick)
+const antilinkWarns = new Map(); // anti-link: "jid:sender" -> strike count (1-2=warned, 3=kick)
 
 async function start() {
     if (starting) return;
@@ -753,7 +753,7 @@ async function start() {
                 continue;
             }
 
-            // 1b. Anti-Link (warn 1st, remove 2nd)
+            // 1b. Anti-Link (3 strikes: warn, final warning, remove)
             if (jid.endsWith('@g.us') && userSettings.antilink && userSettings.groupAdmin && !m.key.fromMe) {
                 const txt = m.message.conversation || m.message.extendedTextMessage?.text || m.message.imageMessage?.caption || m.message.videoMessage?.caption || m.message.documentMessage?.caption || '';
                 const isLink = /(https?:\/\/|www\.|chat\.whatsapp\.com|t\.me|discord\.gg|youtube\.com|youtu\.be|instagram\.com|facebook\.com|tiktok\.com|bit\.ly|tinyurl|wa\.me|\b\w+\.(com|net|org|io|gh|info)\b)/i.test(txt);
@@ -772,16 +772,19 @@ async function start() {
                             const wCount = (antilinkWarns.get(wKey) || 0) + 1;
                             antilinkWarns.set(wKey, wCount);
                             setTimeout(()=> antilinkWarns.delete(wKey), 24*60*60*1000).unref?.();
+                            // Mention with the sender's REAL phone jid — a LID
+                            // mention renders as raw digits, not the contact name
+                            const senderPnAL = await resolveAuthorJid(sock, m.key);
+                            const mentionAL = senderPnAL || senderAL;
                             if (wCount === 1) {
-                                // Mention with the sender's REAL phone jid — a LID
-                                // mention renders as raw digits, not the contact name
-                                const senderPnAL = await resolveAuthorJid(sock, m.key);
-                                const mentionAL = senderPnAL || senderAL;
-                                await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} links not allowed`, mentions: [mentionAL]});
-                                console.log(`[AntiLink] Warn 1/2 for ${senderAL.split('@')[0]} in ${jid}`);
+                                await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} links not allowed (warning 1/3)`, mentions: [mentionAL]});
+                                console.log(`[AntiLink] Warn 1/3 for ${senderAL.split('@')[0]} in ${jid}`);
+                            } else if (wCount === 2) {
+                                await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} final warning — one more link and you're removed (2/3)`, mentions: [mentionAL]});
+                                console.log(`[AntiLink] Warn 2/3 for ${senderAL.split('@')[0]} in ${jid}`);
                             } else {
                                 await sock.groupParticipantsUpdate(jid, [senderAL], 'remove');
-                                console.log(`[AntiLink] Removed ${senderAL.split('@')[0]} in ${jid} (2nd link)`);
+                                console.log(`[AntiLink] Removed ${senderAL.split('@')[0]} in ${jid} (3rd link)`);
                                 antilinkWarns.delete(wKey);
                             }
                         }
