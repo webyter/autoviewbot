@@ -953,7 +953,7 @@ async function start() {
             }
 
             // 5. Auto-Reply (master switch) — ChatAI toggle gates the AI replies below
-            if (!m.key.fromMe && userSettings.autoreply === true && userSettings.chatai !== false) {
+            if (!m.key.fromMe && userSettings.autoreply === true) {
                 const msgText = m.message.conversation || 
                               m.message.extendedTextMessage?.text || 
                               m.message.imageMessage?.caption || 
