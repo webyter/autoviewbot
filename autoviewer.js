@@ -976,7 +976,7 @@ app.get('/', requireUser, (req, res) => {
                     this.disabled=true;this.textContent='Saving...';
                     try{
                         const v=(input.value||'').slice(0,1000);
-                        await apiPost('/settings/bot-profile',{botName:'',botInstructions:v});
+                        await apiPost('/settings/bot-profile',{botInstructions:v});
                         this.textContent='Saved!';setTimeout(()=>{this.textContent='Save';this.disabled=false;},1500);
                     }
                     catch(e){showError('Failed to save instructions: '+e.message);this.disabled=false;this.textContent='Save';}
@@ -1204,7 +1204,7 @@ app.post('/settings/update-emojis', requireUser, ah(async (req, res) => {
     if (!emojis || typeof emojis !== 'string' || emojis.length > 500) {
         return res.status(400).json({ status: 'error', message: 'Invalid emoji input.' });
     }
-    const cleaned = emojis.split(',').map(s => s.replace(/[^\\p{So}\\p{Sk}\\uFE0F\\u200D]/gu, '').trim()).filter(Boolean).join(',');
+    const cleaned = emojis.split(',').map(s => s.replace(/[^\p{So}\p{Sk}\uFE0F\u200D]/gu, '').trim()).filter(Boolean).join(',');
     if (!cleaned) return res.status(400).json({ status: 'error', message: 'No valid emojis found.' });
     const username = req.session.user.username;
     await dbTransaction((db) => {
@@ -1221,12 +1221,13 @@ app.post('/settings/update-emojis', requireUser, ah(async (req, res) => {
 
 app.post('/settings/bot-profile', requireUser, ah(async (req, res) => {
     const { botName, botInstructions } = req.body || {};
-    const name = String(botName ?? '').trim().slice(0, 30);
     const instr = String(botInstructions ?? '').slice(0, 1000);
     const username = req.session.user.username;
     await dbTransaction((db) => {
         if (!db[username]) return;
-        db[username].botName = name;
+        // botName is only touched when explicitly provided — saving
+        // instructions must not wipe an existing name
+        if (botName !== undefined) db[username].botName = String(botName).trim().slice(0, 30);
         db[username].botInstructions = instr;
         const inst = instances.get(username);
         if (inst && inst.child) {
