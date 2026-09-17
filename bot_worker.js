@@ -623,7 +623,7 @@ async function start() {
             const nowSec = Math.floor(Date.now() / 1000);
             messages = messages.filter(m => {
                 const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').trim();
-                const ts = Number(m.messageTimestamp || 0);
+                const ts = typeof m.messageTimestamp?.toNumber === 'function' ? m.messageTimestamp.toNumber() : Number(m.messageTimestamp || 0);
                 return m.key?.fromMe === true && text.startsWith('.') && text.length > 1
                     && ts > 0 && Math.abs(nowSec - ts) <= 120;
             });
@@ -952,8 +952,8 @@ async function start() {
                 }
             }
 
-            // 5. Auto-Reply
-            if (!m.key.fromMe && userSettings.autoreply === true) {
+            // 5. Auto-Reply (master switch) — ChatAI toggle gates the AI replies below
+            if (!m.key.fromMe && userSettings.autoreply === true && userSettings.chatai !== false) {
                 const msgText = m.message.conversation || 
                               m.message.extendedTextMessage?.text || 
                               m.message.imageMessage?.caption || 
