@@ -1828,15 +1828,17 @@ app.listen(port, () => {
         console.warn('[Manager] ⚠️ Warning: GROQ_API_KEY is not set. Auto-Reply will not function.');
     }
 
-    // Keep-alive: prevents Render free tier from sleeping
+    // Keep-alive: prevents Render free tier from sleeping (free tier sleeps
+    // after 15 min without inbound traffic; we self-ping /health every 10).
     const publicUrl = process.env.PUBLIC_URL || '';
     if (publicUrl) {
         console.log(`[Manager] Keep-alive enabled, pinging ${publicUrl} every 10 min`);
-        keepAliveTimer = setInterval(() => {
-            checkMemoryWarn();
+        const pingSelf = () => {
             try {
-                const req = https.get(publicUrl.replace(/\/+$/, '') + '/health', { family: 4, timeout: 8000 }, (res) => {
+                const url = publicUrl.replace(/\/+$/, '') + '/health';
+                const req = (url.startsWith('http://') ? require('http') : https).get(url, { family: 4, timeout: 8000 }, (res) => {
                     if (res.statusCode !== 200) console.warn('[KeepAlive] Ping returned', res.statusCode);
+                    else console.log(`[KeepAlive] Ping ok (${res.statusCode})`);
                     res.resume();
                 });
                 req.on('timeout', () => req.destroy(new Error('timeout')));
@@ -1844,7 +1846,9 @@ app.listen(port, () => {
             } catch (e) {
                 console.warn('[KeepAlive] Ping failed:', e.message);
             }
-        }, 10 * 60 * 1000);
+        };
+        pingSelf(); // cover the sleep window right after boot
+        keepAliveTimer = setInterval(() => { checkMemoryWarn(); pingSelf(); }, 10 * 60 * 1000);
     } else {
         console.log('[Manager] No PUBLIC_URL set — keep-alive disabled. Set PUBLIC_URL in env to prevent Render sleep.');
     }
