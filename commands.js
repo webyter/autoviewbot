@@ -17,7 +17,7 @@ module.exports = function makeHandleOwnerCommand(deps) {
     const wrapStatus = (m) => m ? {
         message: m,
         participant: m.key?.participant || m.participant || '',
-        ts: Number(m.messageTimestamp || 0) * 1000 || Date.now()
+        ts: (typeof m.messageTimestamp?.toNumber === 'function' ? m.messageTimestamp.toNumber() : Number(m.messageTimestamp || 0)) * 1000 || Date.now()
     } : null;
     const _statusStore = {
         get size() { return getStatusStore().size; },
