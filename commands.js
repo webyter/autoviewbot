@@ -245,13 +245,21 @@ async function handleOwnerCommand(sock, body, m, jid) {
 
         case 'ping': {
             const ms = await socketLatency();
-            const delta = Math.max(0, Date.now() - Number(m.messageTimestamp) * 1000);
+            // Baileys messageTimestamp can be a Long — Number() on it yields NaN.
+            const tsNum = typeof m.messageTimestamp?.toNumber === 'function'
+                ? m.messageTimestamp.toNumber()
+                : Number(m.messageTimestamp || 0);
+            const delta = tsNum > 0 ? Math.max(0, Date.now() - tsNum * 1000) : null;
+            const up = process.uptime();
+            const hh = String(Math.floor(up / 3600)).padStart(2, '0');
+            const mm2 = String(Math.floor((up % 3600) / 60)).padStart(2, '0');
+            const ss = String(Math.floor(up % 60)).padStart(2, '0');
             await reply(
 `*⚡ ${fb('PONG')}
 ${DIV}
 🟢 Socket    ${fmtMs(ms)}
 📨 Delivery  ${fmtMs(delta)}
-⏱ Uptime    \`${Math.floor(process.uptime())}s\`
+⏱ Uptime    \`${hh}:${mm2}:${ss}\`
 ${DIV}${FOOT}`);
             break;
         }
