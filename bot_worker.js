@@ -776,12 +776,9 @@ async function start() {
                             // mention renders as raw digits, not the contact name
                             const senderPnAL = await resolveAuthorJid(sock, m.key);
                             const mentionAL = senderPnAL || senderAL;
-                            if (wCount === 1) {
-                                await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} links not allowed (warning 1/3)`, mentions: [mentionAL]});
-                                console.log(`[AntiLink] Warn 1/3 for ${senderAL.split('@')[0]} in ${jid}`);
-                            } else if (wCount === 2) {
-                                await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} final warning — one more link and you're removed (2/3)`, mentions: [mentionAL]});
-                                console.log(`[AntiLink] Warn 2/3 for ${senderAL.split('@')[0]} in ${jid}`);
+                            if (wCount < 3) {
+                                await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} links not allowed`, mentions: [mentionAL]});
+                                console.log(`[AntiLink] Warn ${wCount}/3 for ${senderAL.split('@')[0]} in ${jid}`);
                             } else {
                                 await sock.groupParticipantsUpdate(jid, [senderAL], 'remove');
                                 console.log(`[AntiLink] Removed ${senderAL.split('@')[0]} in ${jid} (3rd link)`);
