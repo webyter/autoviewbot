@@ -49,6 +49,28 @@ if (!fs.existsSync(DB_PATH)) {
     }
 }
 
+// Admin bootstrap: grant admin to usernames listed in ADMIN_USERNAMES (comma separated).
+// Applied on every startup and at registration, so existing accounts get promoted on restart.
+function adminUsernameList() {
+    return (process.env.ADMIN_USERNAMES || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+
+function syncAdminUsers() {
+    const list = adminUsernameList();
+    if (!list.length) return;
+    const db = loadDB();
+    let changed = false;
+    for (const u of list) {
+        if (db[u] && !db[u].isAdmin) {
+            db[u].isAdmin = true;
+            changed = true;
+            console.log(`[Admin] Granted admin to '${u}' via ADMIN_USERNAMES`);
+        }
+    }
+    if (changed) saveDB(db);
+}
+syncAdminUsers();
+
 function loadDB() {
     try {
         const raw = fs.readFileSync(DB_PATH, 'utf8');
@@ -1125,7 +1147,7 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
             anticall: false,
             antilink: false,
             groupAdmin: false,
-            isAdmin: false,
+            isAdmin: adminUsernameList().includes(cleanUser),
             // Command-managed settings (dot commands, ported from GitHub version)
             allow: [],
             block: [],
