@@ -198,12 +198,23 @@ async function handleOwnerCommand(sock, body, m, jid) {
     // Real round-trip latency: protocol ping on the live socket, 3s cap.
     const socketLatency = async () => {
         const ws = currentSocket?.ws;
-        if (!ws?.ping) return null;
+        if (!ws?.ping) {
+            console.log(`[Ping] latency unavailable: ws=${!!ws} ping=${typeof ws?.ping}`);
+            return null;
+        }
         return new Promise((resolve) => {
             const start = Date.now();
-            const t = setTimeout(() => resolve(null), 3000);
-            try { ws.ping(() => { clearTimeout(t); resolve(Date.now() - start); }); }
-            catch (e) { clearTimeout(t); resolve(null); }
+            const t = setTimeout(() => {
+                console.error(`[Ping] ws pong timed out after 3s (readyState=${ws.readyState})`);
+                resolve(null);
+            }, 3000);
+            try {
+                ws.ping((err) => {
+                    clearTimeout(t);
+                    if (err) { console.error('[Ping] ws ping error:', err.message); return resolve(null); }
+                    resolve(Date.now() - start);
+                });
+            } catch (e) { clearTimeout(t); console.error('[Ping] ws ping threw:', e.message); resolve(null); }
         });
     };
 
