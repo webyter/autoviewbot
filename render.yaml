@@ -15,6 +15,8 @@ services:
         value: production
       - key: GROQ_API_KEY
         sync: false
+      - key: ADMIN_USERNAMES
+        value: moi
       - key: SESSION_SECRET
         generateValue: true
       - key: PUBLIC_URL
