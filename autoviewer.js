@@ -869,7 +869,7 @@ app.get('/', requireUser, (req, res) => {
                 <div class="emoji-card">
                     <label>Allow List <span style="text-transform:none;letter-spacing:0">(ChatAI replies — numbers, comma separated. Empty = everyone)</span></label>
                     <div class="emoji-row">
-                        <textarea id="list-input-allow" placeholder="233555123456, 233555654321">${escapeHTML((userData.allow || []).join(', '))}</textarea>
+                        <textarea id="list-input-allow" inputmode="decimal" autocomplete="off" placeholder="233555123456, 233555654321">${escapeHTML((userData.allow || []).join(', '))}</textarea>
                     </div>
                     <div class="emoji-row" style="margin-top:8px">
                         <button class="btn btn-primary btn-emojis list-save-btn" data-listkey="allow">Save</button>
@@ -879,7 +879,7 @@ app.get('/', requireUser, (req, res) => {
                 <div class="emoji-card">
                     <label>Block List <span style="text-transform:none;letter-spacing:0">(ChatAI never replies — numbers, comma separated)</span></label>
                     <div class="emoji-row">
-                        <textarea id="list-input-block" placeholder="233555000000">${escapeHTML((userData.block || []).join(', '))}</textarea>
+                        <textarea id="list-input-block" inputmode="decimal" autocomplete="off" placeholder="233555000000">${escapeHTML((userData.block || []).join(', '))}</textarea>
                     </div>
                     <div class="emoji-row" style="margin-top:8px">
                         <button class="btn btn-primary btn-emojis list-save-btn" data-listkey="block">Save</button>
@@ -889,7 +889,7 @@ app.get('/', requireUser, (req, res) => {
                 <div class="emoji-card">
                     <label>Admin Users <span style="text-transform:none;letter-spacing:0">(can use admin dot-commands — numbers, comma separated)</span></label>
                     <div class="emoji-row">
-                        <textarea id="list-input-admins" placeholder="233555123456">${escapeHTML((userData.admins || []).join(', '))}</textarea>
+                        <textarea id="list-input-admins" inputmode="decimal" autocomplete="off" placeholder="233555123456">${escapeHTML((userData.admins || []).join(', '))}</textarea>
                     </div>
                     <div class="emoji-row" style="margin-top:8px">
                         <button class="btn btn-primary btn-emojis list-save-btn" data-listkey="admins">Save</button>
@@ -1247,7 +1247,7 @@ app.post('/settings/update-lists', requireUser, ah(async (req, res) => {
     if (key === 'persona') {
         cleaned = value.trim().slice(0, 2000);
     } else {
-        cleaned = value.split(/[\n,;\s]+/).map(s => s.replace(/[^0-9]/g, '')).filter(v => v.length >= 8 && v.length <= 15);
+        cleaned = value.split(/[\n,;\s.]+/).map(s => s.replace(/[^0-9]/g, '')).filter(v => v.length >= 8 && v.length <= 15);
         if (cleaned.length > 200) return res.status(400).json({ status: 'error', message: 'List too long (max 200 numbers).' });
     }
     await dbTransaction((db) => {
