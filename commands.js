@@ -307,6 +307,7 @@ ${DIV}${FOOT}`);
             break;
         }
 
+        case 'setting':
         case 'settings': {
             const allow = userSettings.allow || [], block = userSettings.block || [];
             await reply(
@@ -679,13 +680,7 @@ ${DIV}${FOOT}`);
         }
 
         default:
-            await reply(
-`*❓ ${fb('UNKNOWN COMMAND')}
-${DIV}
-\`${cmd}\` — doesn't exist.
-
-Type \`.menu\` for the list.
-${DIV}${FOOT}`);
+            // unknown commands: silent
     }
 }
     return handleOwnerCommand;
