@@ -25,12 +25,6 @@ services:
         generateValue: true
       - key: PUBLIC_URL
         sync: false
-      - key: BACKUP_SUPABASE_URL
-        sync: false
-      - key: BACKUP_SUPABASE_KEY
-        sync: false
-      - key: BACKUP_BUCKET
-        value: autoviewbot-backup
     disk:
       name: session-data
       mountPath: /opt/render/project/src/session
