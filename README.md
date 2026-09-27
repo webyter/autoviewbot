@@ -8,6 +8,7 @@ Production-ready WhatsApp automation with iOS Glass UI.
 - 🤖 **ChatAI**: DM automation via Groq
 - 📱 **Link Method**: QR Code or Pairing Code
 - 👥 **Multi-User**: Independent instances for everyone
+- 🔐 **Invite-Only**: Registration requires an invite code (set `INVITE_CODE`; comma separated for multiple). Without it, registration is closed. Users are pointed to the admin's WhatsApp (`ADMIN_CONTACT`, default 233531556024) for accounts and problems.
 - 👑 **Admin**: Set `ADMIN_USERNAMES` (comma separated) in your environment — matching accounts are granted platform admin at registration, and existing accounts are promoted on restart
 
 ## Hosting on Render
