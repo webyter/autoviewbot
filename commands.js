@@ -77,11 +77,30 @@ const numMatch = (a, b) => {
 };
 
 // Sender's bare number: group participant for groups, chat jid for DMs.
-function senderNumber(m, jid) {
+// LID-aware: on LID accounts the raw jid's digits are NOT the phone number,
+// so allow/block/admin lists (which hold phone numbers) never match. Resolve
+// via the alt fields WhatsApp ships alongside the key, then the LID mapping
+// store; fall back to the raw jid.
+async function senderNumber(m, jid) {
     const src = (jid.endsWith('@g.us') || jid === 'status@broadcast')
         ? (m.key?.participant || m.participant || '')
         : (m.key?.remoteJid || jid);
-    return String(src).split('@')[0];
+    if (!src) return '';
+    try {
+        const { isLidUser, isPnUser, jidNormalizedUser } = await loadBaileys();
+        if (isLidUser(src)) {
+            const alt = m.key?.participantAlt || m.key?.remoteJidAlt;
+            if (alt && isPnUser(alt)) return jidNormalizedUser(alt).split('@')[0];
+            const sock = getCurrentSocket();
+            const res = sock?.signalRepository?.lidMapping?.getPNForLID
+                ? await sock.signalRepository.lidMapping.getPNForLID(src).catch(() => null)
+                : null;
+            if (res) return jidNormalizedUser(res).split('@')[0];
+        }
+        return jidNormalizedUser(src).split('@')[0];
+    } catch {
+        return String(src).split('@')[0];
+    }
 }
 
 // Group admin checks (sender + bot itself).
@@ -95,8 +114,15 @@ async function isGroupAdmin(sock, jid, num) {
 async function botIsGroupAdmin(sock, jid) {
     try {
         const meta = await sock.groupMetadata(jid);
-        const me = (meta?.participants || []).find(pt => numMatch(pt.id, sock.user?.id || ''));
-        return !!(me && (me.admin === 'admin' || me.admin === 'superadmin' || me.isSuperAdmin));
+        // The bot's own jid is often a LID — match both the PN id and the
+        // roster's lid entry before concluding it's not an admin.
+        const myIds = [sock.user?.id, sock.user?.lid].filter(Boolean);
+        const isAdmin = (meta?.participants || []).some(pt =>
+            [pt.id, pt.lid].filter(Boolean).some(jid2 =>
+                myIds.some(mine => mine && numMatch(jid2, mine))
+            ) && (pt.admin === 'admin' || pt.admin === 'superadmin' || pt.isSuperAdmin)
+        );
+        return !!isAdmin;
     } catch { return false; }
 }
 
@@ -221,7 +247,7 @@ async function handleOwnerCommand(sock, body, m, jid) {
     // ── Authorization ─────────────────────────────────────────────────────
     const isOwner = !!m.key.fromMe;
     const isGroup = jid.endsWith('@g.us');
-    const senderNum = senderNumber(m, jid);
+    const senderNum = await senderNumber(m, jid);
     const adminList = Array.isArray(userSettings.admins) ? userSettings.admins : [];
     const listedAdmin = !isOwner && adminList.some(n => numMatch(senderNum, n));
     // .mode public: anyone may run commands. .admin and .mode always stay
