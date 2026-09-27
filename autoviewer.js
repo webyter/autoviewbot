@@ -573,7 +573,10 @@ function loginPage(error = '', req = null) {
     );
 }
 
-function inviteRequired() { return true; }
+// Invite codes are only demanded once the first account exists — a fresh
+// install has a chicken-and-egg problem otherwise. The first signup is the
+// admin (via ADMIN_USERNAMES).
+function inviteRequired() { return Object.keys(loadDB()).length > 0; }
 
 // Registration is invite-only. Admin sets INVITE_CODE (comma separated for
 // multiple codes); with none set, registration is closed. Users with problems
@@ -592,9 +595,9 @@ function registerPage(error = '', req = null) {
              <input name="password" type="password" placeholder="Choose Password" required>
              <button type="button" class="pw-toggle" onclick="togglePw(this)" aria-label="Show password">👁</button>
          </div>
-         <input name="invite" placeholder="Invite Code" required>
+         ${inviteRequired() ? '<input name="invite" placeholder="Invite Code" required>' : ''}
          <button type="submit">Sign Up</button>`,
-        `Registration is invite-only. ${contactFooter}<br>Already registered? <a href="/login">Sign In</a>`,
+        `${inviteRequired() ? `Registration is invite-only. ${contactFooter}<br>` : `<strong>First account</strong> — no invite needed; it becomes the admin.${contactFooter ? '<br>' + contactFooter : ''}<br>`}Already registered? <a href="/login">Sign In</a>`,
         error
     );
 }
@@ -1164,17 +1167,20 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
     if (password.length < 6) return res.status(400).send(registerPage('Password must be at least 6 characters.', req));
 
     // Invite-only registration: INVITE_CODE may hold comma-separated codes.
-    // With no codes configured, registration is closed entirely.
-    const validCodes = (process.env.INVITE_CODE || '').split(',').map(s => s.trim()).filter(Boolean);
-    if (!validCodes.length) {
-        return res.status(403).send(registerPage('Registration is currently closed. Contact the admin to get an invite code.', req));
+    // With no codes configured, registration is closed entirely. The very
+    // first account (empty DB) bypasses the gate — someone has to bootstrap.
+    if (inviteRequired()) {
+        const validCodes = (process.env.INVITE_CODE || '').split(',').map(s => s.trim()).filter(Boolean);
+        if (!validCodes.length) {
+            return res.status(403).send(registerPage('Registration is currently closed. Contact the admin to get an invite code.', req));
+        }
+        const a = Buffer.from(String(req.body.invite || ''));
+        const codeOk = validCodes.some((code) => {
+            const b = Buffer.from(code);
+            return a.length === b.length && crypto.timingSafeEqual(a, b);
+        });
+        if (!codeOk) return res.status(403).send(registerPage('Invalid invite code. Contact the admin to get one.', req));
     }
-    const a = Buffer.from(String(req.body.invite || ''));
-    const codeOk = validCodes.some((code) => {
-        const b = Buffer.from(code);
-        return a.length === b.length && crypto.timingSafeEqual(a, b);
-    });
-    if (!codeOk) return res.status(403).send(registerPage('Invalid invite code. Contact the admin to get one.', req));
 
     const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
     if (!isValidUsername(cleanUser)) return res.status(400).send(registerPage('Username must be 2-20 alphanumeric characters.', req));
