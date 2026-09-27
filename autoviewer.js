@@ -7,6 +7,7 @@ const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcrypt');
 const https = require('https');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { fork } = require('child_process');
@@ -402,6 +403,27 @@ app.use(session({
     }
 }));
 
+// ── CSRF Protection ──────────────────────────────────────────────────────────
+// Session-bound token. Server-rendered pages embed it: native forms (login,
+// register) submit it as a _csrf field, the dashboard/admin fetch wrappers
+// send it as an X-CSRF-Token header. SameSite=Lax cookies back this up.
+function csrfToken(req) {
+    if (!req.session.csrf) req.session.csrf = crypto.randomBytes(24).toString('hex');
+    return req.session.csrf;
+}
+app.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    const token = req.get('X-CSRF-Token') || (req.body && req.body._csrf) || '';
+    const expected = req.session.csrf || '';
+    const ok = expected && typeof token === 'string' && token.length === expected.length &&
+        crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+    if (!ok) {
+        if (req.path.startsWith('/api')) return res.status(403).json({ status: 'error', message: 'Bad CSRF token. Refresh the page and try again.' });
+        return res.status(403).send(loginPage('Session expired — please try again.', req));
+    }
+    next();
+});
+
 // ── Auth Middleware ──────────────────────────────────────────────────────────
 function requireUser(req, res, next) {
     if (!req.session.user) {
@@ -536,32 +558,45 @@ function sPage(title, subtitle, icon, accent, fields, footer, error) {
     </body></html>`;
 }
 
-function loginPage(error = '') {
+function loginPage(error = '', req = null) {
+    const csrf = req ? csrfToken(req) : '';
     return sPage('Sign In', 'Sign in to your account',
         '<svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z" fill="#007aff"/></svg>',
         '#007aff',
-        `<input name="username" placeholder="Username" required autofocus>
+        `<input type="hidden" name="_csrf" value="${csrf}">
+         <input name="username" placeholder="Username" required autofocus>
          <div class="pw-wrap">
              <input name="password" type="password" placeholder="Password" required>
              <button type="button" class="pw-toggle" onclick="togglePw(this)" aria-label="Show password">👁</button>
          </div>
          <button type="submit">Sign In</button>`,
-        `New here? <a href="/register">Create account</a>`,
+        `Having problems? Contact the admin on <a href="https://wa.me/${ADMIN_CONTACT}" target="_blank" rel="noopener" style="color:var(--accent)">WhatsApp</a>.<br>New here? <a href="/register">Create account</a>`,
         error
     );
 }
 
-function registerPage(error = '') {
+function inviteRequired() { return true; }
+
+// Registration is invite-only. Admin sets INVITE_CODE (comma separated for
+// multiple codes); with none set, registration is closed. Users with problems
+// are pointed at the admin's WhatsApp.
+const ADMIN_CONTACT = process.env.ADMIN_CONTACT || '233531556024';
+const contactFooter = `Having problems or want an account? Contact the admin on <a href="https://wa.me/${ADMIN_CONTACT}" target="_blank" rel="noopener" style="color:var(--accent)">WhatsApp</a>.`;
+
+function registerPage(error = '', req = null) {
+    const csrf = req ? csrfToken(req) : '';
     return sPage('Create Account', 'Join the AutoViewer platform',
         '<svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" fill="#007aff"/></svg>',
         '#007aff',
-        `<input name="username" placeholder="Choose Username" required autofocus>
+        `<input type="hidden" name="_csrf" value="${csrf}">
+         <input name="username" placeholder="Choose Username" required autofocus>
          <div class="pw-wrap">
              <input name="password" type="password" placeholder="Choose Password" required>
              <button type="button" class="pw-toggle" onclick="togglePw(this)" aria-label="Show password">👁</button>
          </div>
+         <input name="invite" placeholder="Invite Code" required>
          <button type="submit">Sign Up</button>`,
-        `Already registered? <a href="/login">Sign In</a>`,
+        `Registration is invite-only. ${contactFooter}<br>Already registered? <a href="/login">Sign In</a>`,
         error
     );
 }
@@ -936,8 +971,9 @@ app.get('/', requireUser, (req, res) => {
             function $(id){return document.getElementById(id)}
             let pollTimer=null,lastQrKey='',prevIsOnline=null;
 
+            const CSRF_TOKEN='${csrfToken(req)}';
             async function apiPost(url,body){
-                const resp=await fetch(url,{method:'POST',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});
+                const resp=await fetch(url,{method:'POST',headers:body?{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN}:{'X-CSRF-Token':CSRF_TOKEN},body:body?JSON.stringify(body):undefined});
                 if(!resp.ok){const txt=await resp.text();let msg;try{const j=JSON.parse(txt);msg=j.message||j.error||txt;}catch(e){msg=txt||resp.statusText;}throw new Error(msg);}
                 return resp;
             }
@@ -1097,13 +1133,13 @@ app.get('/', requireUser, (req, res) => {
 });
 
 app.get('/login', (req, res) => {
-    res.send(loginPage());
+    res.send(loginPage('', req));
 });
 
 app.post('/login', loginLimiter, ah(async (req, res) => {
     const { username, password } = req.body || {};
     const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (!cleanUser || !isValidUsername(cleanUser) || typeof password !== 'string' || !password || password.length < 6 || password.length > 100) return res.status(401).send(loginPage('Invalid username or password.'));
+    if (!cleanUser || !isValidUsername(cleanUser) || typeof password !== 'string' || !password || password.length < 6 || password.length > 100) return res.status(401).send(loginPage('Invalid username or password.', req));
     
     const db = loadDB();
     if (db[cleanUser] && await bcrypt.compare(password, db[cleanUser].password)) {
@@ -1113,11 +1149,11 @@ app.post('/login', loginLimiter, ah(async (req, res) => {
         });
         return;
     }
-    res.status(401).send(loginPage('Invalid username or password.'));
+    res.status(401).send(loginPage('Invalid username or password.', req));
 }));
 
 app.get('/register', (req, res) => {
-    res.send(registerPage());
+    res.send(registerPage('', req));
 });
 
 function isValidUsername(u) {
@@ -1126,11 +1162,24 @@ function isValidUsername(u) {
 
 app.post('/register', registerLimiter, ah(async (req, res) => {
     const { username, password } = req.body || {};
-    if (!username || !password) return res.status(400).send(registerPage('Username and password are required.'));
-    if (password.length < 6) return res.status(400).send(registerPage('Password must be at least 6 characters.'));
+    if (!username || !password) return res.status(400).send(registerPage('Username and password are required.', req));
+    if (password.length < 6) return res.status(400).send(registerPage('Password must be at least 6 characters.', req));
+
+    // Invite-only registration: INVITE_CODE may hold comma-separated codes.
+    // With no codes configured, registration is closed entirely.
+    const validCodes = (process.env.INVITE_CODE || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!validCodes.length) {
+        return res.status(403).send(registerPage('Registration is currently closed. Contact the admin to get an invite code.', req));
+    }
+    const a = Buffer.from(String(req.body.invite || ''));
+    const codeOk = validCodes.some((code) => {
+        const b = Buffer.from(code);
+        return a.length === b.length && crypto.timingSafeEqual(a, b);
+    });
+    if (!codeOk) return res.status(403).send(registerPage('Invalid invite code. Contact the admin to get one.', req));
 
     const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (!isValidUsername(cleanUser)) return res.status(400).send(registerPage('Username must be 2-20 alphanumeric characters.'));
+    if (!isValidUsername(cleanUser)) return res.status(400).send(registerPage('Username must be 2-20 alphanumeric characters.', req));
 
     const hashed = await bcrypt.hash(password, 10);
     let taken = false;
@@ -1161,7 +1210,7 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
             running: false
         };
     });
-    if (taken) return res.status(409).send(registerPage('Registration failed.'));
+    if (taken) return res.status(409).send(registerPage('Registration failed.', req));
     res.redirect('/login');
 }));
 
@@ -1627,8 +1676,9 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                 $('toasts').appendChild(t);
                 setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .4s';setTimeout(()=>t.remove(),400)},3600);
             }
+            const CSRF_TOKEN='${csrfToken(req)}';
             async function api(url,body){
-                const r=await fetch(url,{method:'POST',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});
+                const r=await fetch(url,{method:'POST',headers:body?{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN}:{'X-CSRF-Token':CSRF_TOKEN},body:body?JSON.stringify(body):undefined});
                 if(!r.ok){
                     const t=await r.text();let msg;
                     try{const j=JSON.parse(t);msg=j.message||j.error||t}catch(e){msg=t||r.statusText}
