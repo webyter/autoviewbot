@@ -17,6 +17,10 @@ services:
         sync: false
       - key: ADMIN_USERNAMES
         value: moi
+      - key: ADMIN_CONTACT
+        value: 233531556024
+      - key: INVITE_CODE
+        sync: false
       - key: SESSION_SECRET
         generateValue: true
       - key: PUBLIC_URL
