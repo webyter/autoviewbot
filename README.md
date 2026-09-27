@@ -16,10 +16,16 @@ To host this platform on Render, follow these steps:
 
 1. **GitHub**: Push this code to your GitHub repository.
 2. **Deploy**: Click the "Deploy to Render" button or create a new "Web Service".
-3. **Persistence**: On the **free plan** Render has no persistent disk — every restart or deploy wipes the filesystem. This repo ships two countermeasures:
-   - **Keep-alive**: the manager self-pings `/health` every 10 min (uses `PUBLIC_URL`, or `RENDER_EXTERNAL_URL` automatically on Render) so the free service never sleeps after 15 idle minutes.
-   - **Session backup**: set `BACKUP_SUPABASE_URL`, `BACKUP_SUPABASE_KEY` (service_role key) and create a **private** Supabase Storage bucket named in `BACKUP_BUCKET`. The `session/` directory is AES-256-GCM encrypted (key derived from `SESSION_SECRET`) and synced to the bucket every 3 minutes when dirty, restored automatically on boot, and uploaded once more on shutdown. Without this, users are logged out on every restart.
-   - On paid plans with a Persistent Disk (Mount Path: `/home/graile/autoviewbot/session`), the backup is a harmless redundancy.
+3. **Persistence**: On the **free plan** Render has no persistent disk — every restart or deploy wipes the filesystem, logging users out. For real use, host on a VPS (see below) or a paid plan with a Persistent Disk (Mount Path: `/home/graile/autoviewbot/session`). The built-in keep-alive (self-pings `/health` via `PUBLIC_URL` or `RENDER_EXTERNAL_URL`) prevents the free tier's 15-min idle sleep.
+
+## Hosting on a VPS
+```bash
+git clone https://github.com/webyter/autoviewbot && cd autoviewbot
+npm install
+cp .env.example .env   # then edit: SESSION_SECRET, GROQ_API_KEY, INVITE_CODE, ADMIN_USERNAMES
+npm i -g pm2 && pm2 start autoviewer.js --name autoviewer && pm2 save && pm2 startup
+```
+Sessions persist in `./session/` on the VPS disk. Put nginx + certbot in front for HTTPS.
 
 ## Local Run
 ```bash
