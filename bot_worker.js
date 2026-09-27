@@ -664,10 +664,10 @@ async function start() {
             // statuses with fresh ids) and would otherwise crowd out real chats.
             if (!m.key.fromMe) {
                 if (jid === 'status@broadcast') {
-                    if (userSettings.antideleteStatus !== false) {
-                        _statusMsgStore.set(m.key.id, m);
-                        if (_statusMsgStore.size > 200) _statusMsgStore.delete(_statusMsgStore.keys().next().value);
-                    }
+                    // ALWAYS store — .save needs this even when anti-delete-status
+                    // is off (only the delete ALERT is gated, in the revoke handler).
+                    _statusMsgStore.set(m.key.id, m);
+                    if (_statusMsgStore.size > 200) _statusMsgStore.delete(_statusMsgStore.keys().next().value);
                 } else {
                     if (userSettings.antideleteMsg !== false) {
                         _msgStore.set(m.key.id, m);
@@ -774,12 +774,14 @@ async function start() {
                             setTimeout(()=> antilinkWarns.delete(wKey), 24*60*60*1000).unref?.();
                             // Mention with the sender's REAL phone jid — a LID
                             // mention renders as raw digits, not the contact name
-                            const senderPnAL = await resolveAuthorJid(sock, m.key);
-                            const mentionAL = senderPnAL || senderAL;
-                            if (wCount < 3) {
+                            if (wCount === 1) {
+                                // Warn ONCE. Further links are deleted silently —
+                                // repeat warnings just feed the troll.
+                                const senderPnAL = await resolveAuthorJid(sock, m.key);
+                                const mentionAL = senderPnAL || senderAL;
                                 await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} links not allowed`, mentions: [mentionAL]});
-                                console.log(`[AntiLink] Warn ${wCount}/3 for ${senderAL.split('@')[0]} in ${jid}`);
-                            } else {
+                                console.log(`[AntiLink] Warned ${senderAL.split('@')[0]} in ${jid} (1st link)`);
+                            } else if (wCount >= 3) {
                                 await sock.groupParticipantsUpdate(jid, [senderAL], 'remove');
                                 console.log(`[AntiLink] Removed ${senderAL.split('@')[0]} in ${jid} (3rd link)`);
                                 antilinkWarns.delete(wKey);
@@ -921,18 +923,11 @@ async function start() {
                     /@\s*(all|everyone|group)/i.test(text);
                 if (hasGroupTag) {
                     const senderJid = (await resolveAuthorJid(sock, m.key)) || m.key.participant || m.key.remoteJid;
+                    // Silent delete — no public warning, no chatter.
                     try {
                         await sock.sendMessage(jid, { delete: m.key });
                         console.log(`[Anti-Tag] Deleted status with group tag from ${senderJid?.split('@')[0] || 'unknown'}`);
                     } catch (e) { console.error('[Anti-Tag] Delete error:', e.message); }
-                    try {
-                        if (senderJid) {
-                            await sock.sendMessage('status@broadcast', {
-                                text: `⚠️ @${senderJid.split('@')[0]} do not tag groups in status`,
-                                mentions: [senderJid]
-                            });
-                        }
-                    } catch (e) { console.error('[Anti-Tag] Warn error:', e.message); }
                     continue;
                 }
             }
