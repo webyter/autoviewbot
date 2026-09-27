@@ -990,7 +990,12 @@ async function start() {
                 // Allow/block gates (managed via .allow / .block dot commands).
                 // Block always wins; empty allow = reply to everyone.
                 const gateNum = (n) => String(n || '').replace(/\D/g, '').replace(/^00233/, '').replace(/^233/, '').replace(/^0/, '');
-                const senderNum = String((jid.endsWith('@g.us') || jid === 'status@broadcast') ? (m.key?.participant || '') : (m.key?.remoteJid || jid)).split('@')[0];
+                // Resolve LID jids to the real phone number BEFORE list matching —
+                // allow/block hold phone numbers, and on LID accounts the DM jid /
+                // group participant is a @lid whose digits match nothing.
+                const rawSender = (jid.endsWith('@g.us') || jid === 'status@broadcast') ? (m.key?.participant || '') : (m.key?.remoteJid || jid);
+                const resolvedSender = await resolveAuthorJid(sock, m.key) || rawSender;
+                const senderNum = String(resolvedSender).split('@')[0];
                 const allowList = Array.isArray(userSettings.allow) ? userSettings.allow : [];
                 const blockList = Array.isArray(userSettings.block) ? userSettings.block : [];
                 if (blockList.some(n => gateNum(n) && gateNum(n) === gateNum(senderNum))) continue;
