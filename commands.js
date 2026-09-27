@@ -598,9 +598,17 @@ _Media above — delivered here._
 ${DIV}${FOOT}` }).catch(() => {});
                 }
             } catch (e) {
-                // Never leak bot output into a contact's chat — DM errors
-                // go to the owner's self-chat, group errors reply inline.
                 console.error('[Cmd] reveal failed:', e.message);
+                // Never leak bot output into a contact's chat — dest is either
+                // the group itself or the owner's own chat, so failing there is
+                // safe. Silence here would just look like the bot ignoring .vv.
+                try {
+                    await sock.sendMessage(dest, { text:
+`*🔓 ${fb('VIEW-ONCE')} — FAILED*
+${DIV}
+${e.message}
+${DIV}${FOOT}` });
+                } catch (e2) { console.error('[Cmd] reveal feedback failed:', e2.message); }
             }
             break;
         }
