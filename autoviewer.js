@@ -11,7 +11,6 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { fork } = require('child_process');
-const persist = require('./lib/persist.js');
 const QRCode = require('qrcode');
 const rateLimit = require('express-rate-limit');
 require('dotenv/config');
@@ -47,8 +46,7 @@ if (!fs.existsSync(DB_PATH)) {
         fs.copyFileSync(legacyDB, DB_PATH);
         try { fs.unlinkSync(legacyDB); } catch (e) {}
     } else {
-        // Don't pre-create '{}': an absent users.json is the signal that the
-        // ephemeral disk was wiped and lib/persist.js should restore backup.
+        fs.writeFileSync(DB_PATH, '{}');
     }
 }
 
@@ -1870,35 +1868,15 @@ function cleanup() {
         }
     });
 }
-async function shutdown() {
-    // Fire a final backup upload before exit — Render wipes the ephemeral disk
-    // the moment the container goes away, so this is often the last chance.
-    try {
-        await Promise.race([
-            persist.saveNow(SESSION_BASE),
-            new Promise((r) => setTimeout(r, 6000)),
-        ]);
-    } catch (e) { /* best-effort */ }
+function shutdown() {
     cleanup();
     process.exit(0);
 }
 process.on('SIGINT', () => { shutdown(); });
 process.on('SIGTERM', () => { shutdown(); });
 
-(async () => {
-    // Restore session data from the external backup if the ephemeral disk came
-    // up empty (Render free tier wipes the filesystem on every restart/deploy).
-    try {
-        const restored = await persist.restoreIfEmpty(SESSION_BASE, DB_PATH);
-        if (restored) syncAdminUsers();
-    } catch (e) {
-        console.warn('[Manager] Backup restore failed:', e.message);
-    }
-    app.listen(port, () => {
-        console.log(`[Manager] Multi-user dashboard running at http://localhost:${port}`);
-
-    // Start the backup change-monitor once the restored/loaded session data is in place.
-    persist.watchAndBackup(SESSION_BASE);
+app.listen(port, () => {
+    console.log(`[Manager] Multi-user dashboard running at http://localhost:${port}`);
 
     if (!process.env.GROQ_API_KEY && !config.GROQ_API_KEY) {
         console.warn('[Manager] ⚠️ Warning: GROQ_API_KEY is not set. Auto-Reply will not function.');
@@ -1952,8 +1930,7 @@ const publicUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '
             startUserBot(username, false);
         }, i * 5000); // stagger 5s apart to avoid network contention
     });
-    });
-})();
+});
 
 
 
