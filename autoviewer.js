@@ -1654,7 +1654,8 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                         '<code style="font-size:12px;font-weight:700;letter-spacing:.5px;color:#fff;flex:1;overflow:hidden;text-overflow:ellipsis">'+esc(c.code)+'</code>'+
                         '<span style="font-size:10px;color:rgba(255,255,255,.35)">'+esc(uses)+exp+'</span>'+
                         '<span class="pill" style="'+(INV_PILL[c.status]||'')+'">'+esc(c.status)+'</span>'+
-                        (c.status==='active'?'<button class="btn" data-inv="revoke" data-code="'+esc(c.code)+'" style="flex:0 0 auto;padding:5px 10px;background:rgba(255,159,10,.18);color:#ff9f0a">Revoke</button>':'')+
+                        (c.status==='active'?'<button class="btn bd" data-inv="copylink" data-code="'+esc(c.code)+'" style="flex:0 0 auto;padding:5px 10px" title="Copy invite link">🔗</button>'+
+                        '<button class="btn" data-inv="revoke" data-code="'+esc(c.code)+'" style="flex:0 0 auto;padding:5px 10px;background:rgba(255,159,10,.18);color:#ff9f0a">Revoke</button>':'')+
                         '<button class="btn bd" data-inv="delete" data-code="'+esc(c.code)+'" style="flex:0 0 auto;padding:5px 10px" title="Delete">🗑</button>'+
                         '</div>';
                 }).join('');
@@ -1665,7 +1666,8 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                     const r=await api('/api/admin/invites/create',{maxUses:parseInt($('inv-uses').value,10)||1,expiresInDays:parseInt($('inv-days').value,10)||0});
                     const j=await r.json();
                     toast('Created '+j.code);
-                    try{await navigator.clipboard.writeText(j.code)}catch(e){}
+                    const link=j.url||(location.origin+'/register?code='+encodeURIComponent(j.code));
+                    try{await navigator.clipboard.writeText(link)}catch(e){}
                     await pollInvites();
                 }catch(e){toast('Create failed: '+e.message,false)}
                 this.disabled=false;
@@ -1673,6 +1675,7 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
             $('inv-list').addEventListener('click',async ev=>{
                 const b=ev.target.closest('button[data-inv]');if(!b)return;
                 const act=b.dataset.inv,code=b.dataset.code;
+                if(act==='copylink'){try{await navigator.clipboard.writeText(location.origin+'/register?code='+encodeURIComponent(code));toast('Invite link copied')}catch(e){toast('Copy failed',false)}return}
                 if(act==='delete'&&!confirm('Delete invite '+code+'?'))return;
                 b.disabled=true;
                 try{await api('/api/admin/invites/'+act,{code});toast(act[0].toUpperCase()+act.slice(1)+'d '+code);await pollInvites()}
@@ -1746,7 +1749,11 @@ app.post('/api/admin/invites/create', requireUser, requireAdmin, (req, res) => {
         if (error) return res.status(400).json({ status: 'error', message: error });
         if (!created) return res.status(503).json({ status: 'error', message: 'Invite store temporarily unavailable.' });
         console.log(`[Invites] Created ${created} by ${req.session.user.username}`);
-        res.json({ status: 'ok', code: created, invite: createdEntry });
+        // Full invite link: PUBLIC_URL/RENDER_EXTERNAL_URL when set, otherwise
+        // derive from the request (trust proxy is on, so this is the public host).
+        const base = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || (req.protocol + '://' + req.get('host'));
+        const url = base.replace(/\/+$/, '') + '/register?code=' + encodeURIComponent(created);
+        res.json({ status: 'ok', code: created, invite: createdEntry, url });
     });
 });
 app.post('/api/admin/invites/revoke', requireUser, requireAdmin, (req, res) => {

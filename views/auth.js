@@ -146,6 +146,8 @@ const contactFooter = `Having problems or want an account? Contact the admin on 
 
 function registerPage(error = '', req = null) {
     const csrf = req ? csrfToken(req) : '';
+    // ?code=INV-... from an invite link pre-fills the field (sanitized).
+    const preInvite = (req && req.query && typeof req.query.code === 'string') ? req.query.code.slice(0, 64) : '';
     return sPage('Create Account', 'Join the AutoViewer platform',
         '<svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" fill="#007aff"/></svg>',
         '#007aff',
@@ -155,7 +157,7 @@ function registerPage(error = '', req = null) {
              <input name="password" type="password" placeholder="Choose Password" required>
              <button type="button" class="pw-toggle" onclick="togglePw(this)" aria-label="Show password">👁</button>
          </div>
-         ${inviteRequired() ? '<input name="invite" placeholder="Invite Code" required>' : ''}
+         ${inviteRequired() ? `<input name="invite" placeholder="Invite Code" required value="${escapeHTML(preInvite)}">` : ''}
          <button type="submit">Sign Up</button>`,
         `${inviteRequired() ? `Registration is invite-only. ${contactFooter}<br>` : `<strong>First account</strong> — no invite needed; it becomes the admin.${contactFooter ? '<br>' + contactFooter : ''}<br>`}Already registered? <a href="/login">Sign In</a>`,
         error
