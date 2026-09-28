@@ -1166,19 +1166,33 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
     if (!username || !password) return res.status(400).send(registerPage('Username and password are required.', req));
     if (password.length < 6) return res.status(400).send(registerPage('Password must be at least 6 characters.', req));
 
-    // Invite-only registration: INVITE_CODE may hold comma-separated codes.
-    // With no codes configured, registration is closed entirely. The very
-    // first account (empty DB) bypasses the gate — someone has to bootstrap.
+    // Invite-only registration: valid codes are INVITE_CODE env entries plus
+    // admin-managed codes stored in the invite store (single-use/expiry aware).
+    // With no codes at all, registration is closed entirely. The very first
+    // account (empty DB) bypasses the gate — someone has to bootstrap.
+    let dbInviteCode = null;
     if (inviteRequired()) {
-        const validCodes = (process.env.INVITE_CODE || '').split(',').map(s => s.trim()).filter(Boolean);
-        if (!validCodes.length) {
+        const envCodes = (process.env.INVITE_CODE || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+        if (!envCodes.length && !hasActiveInvites()) {
             return res.status(403).send(registerPage('Registration is currently closed. Contact the admin to get an invite code.', req));
         }
-        const a = Buffer.from(String(req.body.invite || ''));
-        const codeOk = validCodes.some((code) => {
+        const invite = String(req.body.invite || '').trim().toUpperCase();
+        const a = Buffer.from(invite);
+        const envOk = envCodes.some((code) => {
             const b = Buffer.from(code);
             return a.length === b.length && crypto.timingSafeEqual(a, b);
         });
+        let codeOk = envOk;
+        if (!codeOk) {
+            // Timing-safe scan of the admin-managed store; only entries that
+            // are live (not revoked, under their use cap, unexpired) match.
+            const invites = loadInvites();
+            for (const [code, entry] of Object.entries(invites)) {
+                if (!isInviteLive(entry)) continue;
+                const b = Buffer.from(code);
+                if (a.length === b.length && crypto.timingSafeEqual(a, b)) { dbInviteCode = code; codeOk = true; break; }
+            }
+        }
         if (!codeOk) return res.status(403).send(registerPage('Invalid invite code. Contact the admin to get one.', req));
     }
 
@@ -1202,7 +1216,7 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
             anticall: false,
             antilink: false,
             groupAdmin: false,
-            isAdmin: adminUsernameList().includes(cleanUser),
+            isAdmin: adminUsernameList().includes(cleanUser) || Object.keys(db).length === 0,
             // Command-managed settings (dot commands, ported from GitHub version)
             allow: [],
             block: [],
@@ -1213,6 +1227,7 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
             botInstructions: '',
             running: false
         };
+        consumeInvite(dbInviteCode);
     });
     if (taken) return res.status(409).send(registerPage('Registration failed.', req));
     res.redirect('/login');
@@ -1661,6 +1676,17 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                 </div>
             </div>
 
+            <div class="ann">
+                <div class="ann-t">🎟 Invite Codes</div>
+                <div class="ann-s">Registration codes — env INVITE_CODE stays valid alongside these</div>
+                <div class="ann-row">
+                    <input type="number" id="inv-uses" min="1" max="999" value="1" title="Max uses (1 = single-use)" style="width:80px;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.35);color:#fff;font-size:13px;outline:none">
+                    <input type="number" id="inv-days" min="0" max="3650" value="0" title="Expires in days (0 = never)" style="width:80px;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.35);color:#fff;font-size:13px;outline:none">
+                    <button class="btn bg annb" id="inv-gen" style="flex:0 0 auto">Generate</button>
+                </div>
+                <div id="inv-list" style="margin-top:10px"></div>
+            </div>
+
             <div class="bar">
                 <input type="text" id="q" class="search" placeholder="🔍  Search users…">
                 <div class="err" id="err"></div>
@@ -1767,6 +1793,44 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                 $('ann-set').onclick=async function(){this.disabled=true;try{await api('/api/admin/announcement',{text:$('ann-in').value});toast('Announcement updated')}catch(e){toast('Set failed: '+e.message,false)}this.disabled=false};
                 $('ann-clr').onclick=async function(){this.disabled=true;try{await api('/api/admin/announcement',{text:''});$('ann-in').value='';toast('Announcement cleared')}catch(e){toast('Clear failed: '+e.message,false)}this.disabled=false};
             }
+            const INV_PILL={active:'background:rgba(48,209,88,.12);color:#30d158',exhausted:'background:rgba(255,159,10,.12);color:#ff9f0a',expired:'background:rgba(255,159,10,.12);color:#ff9f0a',revoked:'background:rgba(255,69,58,.12);color:#ff453a'};
+            async function pollInvites(){
+                let d;
+                try{d=await getJSON('/api/admin/invites')}catch(e){return}
+                const list=d.invites||[];
+                const box=$('inv-list');
+                if(!list.length){box.innerHTML='<div style="font-size:11px;color:rgba(255,255,255,.3);padding:6px 0">No codes yet — registration relies on INVITE_CODE env / stays closed</div>';return}
+                box.innerHTML=list.map(c=>{
+                    const exp=c.expiresAt?' · expires '+new Date(c.expiresAt).toLocaleDateString():'';
+                    const uses=c.maxUses?c.uses+'/'+c.maxUses+' used':c.uses+' used';
+                    return '<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;margin-top:6px;border-radius:10px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.07)">'+
+                        '<code style="font-size:12px;font-weight:700;letter-spacing:.5px;color:#fff;flex:1;overflow:hidden;text-overflow:ellipsis">'+esc(c.code)+'</code>'+
+                        '<span style="font-size:10px;color:rgba(255,255,255,.35)">'+esc(uses)+exp+'</span>'+
+                        '<span class="pill" style="'+(INV_PILL[c.status]||'')+'">'+esc(c.status)+'</span>'+
+                        (c.status==='active'?'<button class="btn" data-inv="revoke" data-code="'+esc(c.code)+'" style="flex:0 0 auto;padding:5px 10px;background:rgba(255,159,10,.18);color:#ff9f0a">Revoke</button>':'')+
+                        '<button class="btn bd" data-inv="delete" data-code="'+esc(c.code)+'" style="flex:0 0 auto;padding:5px 10px" title="Delete">🗑</button>'+
+                        '</div>';
+                }).join('');
+            }
+            $('inv-gen').onclick=async function(){
+                this.disabled=true;
+                try{
+                    const r=await api('/api/admin/invites/create',{maxUses:parseInt($('inv-uses').value,10)||1,expiresInDays:parseInt($('inv-days').value,10)||0});
+                    const j=await r.json();
+                    toast('Created '+j.code);
+                    try{await navigator.clipboard.writeText(j.code)}catch(e){}
+                    await pollInvites();
+                }catch(e){toast('Create failed: '+e.message,false)}
+                this.disabled=false;
+            };
+            $('inv-list').addEventListener('click',async ev=>{
+                const b=ev.target.closest('button[data-inv]');if(!b)return;
+                const act=b.dataset.inv,code=b.dataset.code;
+                if(act==='delete'&&!confirm('Delete invite '+code+'?'))return;
+                b.disabled=true;
+                try{await api('/api/admin/invites/'+act,{code});toast(act[0].toUpperCase()+act.slice(1)+'d '+code);await pollInvites()}
+                catch(e){toast('Failed: '+e.message,false);b.disabled=false}
+            });
             $('max-save').onclick = async function () {
                 const v = parseInt($('max-in').value, 10);
                 if (!Number.isFinite(v) || v < 1 || v > 50) { toast('Max bots must be 1-50', false); return; }
@@ -1775,7 +1839,7 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                 catch (e) { toast('Save failed: ' + e.message, false); }
                 this.disabled = false;
             };
-            initAnn();poll();setInterval(poll,4000);
+            initAnn();pollInvites();setInterval(pollInvites,10000);poll();setInterval(poll,4000);
         </script>
     </body></html>`);
 });
@@ -1793,6 +1857,102 @@ function setAnnouncement(text) {
     fs.writeFileSync(ANNOUNCE_PATH, JSON.stringify({ text: clean, ts: Date.now() }));
     return clean;
 }
+
+// ── Admin-managed invite codes ──────────────────────────────────────────────
+// Stored in session/invites.json, independent of the user DB. Shape:
+//   { "INV-XXXXX-XXXXX": { createdAt, createdBy, uses, maxUses, expiresAt, revoked } }
+// maxUses/expiresAt may be null (= unlimited / never expires). INVITE_CODE env
+// entries remain valid alongside these.
+const INVITES_PATH = path.join(SESSION_BASE, 'invites.json');
+function loadInvites() {
+    try { return JSON.parse(fs.readFileSync(INVITES_PATH, 'utf8')); }
+    catch (e) { return {}; }
+}
+function saveInvites(data) {
+    const tmp = INVITES_PATH + '.tmp.' + process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, INVITES_PATH);
+}
+function isInviteLive(entry) {
+    if (!entry || entry.revoked) return false;
+    if (Number.isFinite(entry.maxUses) && entry.maxUses > 0 && (entry.uses || 0) >= entry.maxUses) return false;
+    if (Number.isFinite(entry.expiresAt) && entry.expiresAt > 0 && Date.now() > entry.expiresAt) return false;
+    return true;
+}
+function hasActiveInvites() {
+    return Object.values(loadInvites()).some(isInviteLive);
+}
+function consumeInvite(code) {
+    if (!code) return;
+    try {
+        const invites = loadInvites();
+        if (invites[code]) {
+            invites[code].uses = (invites[code].uses || 0) + 1;
+            saveInvites(invites);
+        }
+    } catch (e) { console.error('[Invites] Consume failed:', e.message); }
+}
+function generateInviteCode() {
+    const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no I,L,O,0,1 — unambiguous when read aloud
+    const part = (n) => Array.from(crypto.randomBytes(n)).map(b => alphabet[b % alphabet.length]).join('');
+    const invites = loadInvites();
+    let code;
+    do { code = 'INV-' + part(5) + '-' + part(5); } while (invites[code]);
+    return code;
+}
+function inviteStatus(entry) {
+    if (entry.revoked) return 'revoked';
+    if (Number.isFinite(entry.expiresAt) && entry.expiresAt > 0 && Date.now() > entry.expiresAt) return 'expired';
+    if (Number.isFinite(entry.maxUses) && entry.maxUses > 0 && (entry.uses || 0) >= entry.maxUses) return 'exhausted';
+    return 'active';
+}
+
+app.get('/api/admin/invites', requireUser, requireAdmin, (req, res) => {
+    const invites = loadInvites();
+    const list = Object.entries(invites).map(([code, e]) => ({
+        code, createdBy: e.createdBy || null, createdAt: e.createdAt || null,
+        uses: e.uses || 0, maxUses: e.maxUses || null,
+        expiresAt: e.expiresAt || null, revoked: !!e.revoked,
+        status: inviteStatus(e)
+    })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    res.json({ invites: list });
+});
+app.post('/api/admin/invites/create', requireUser, requireAdmin, (req, res) => {
+    const maxUses = parseInt((req.body || {}).maxUses, 10);
+    const days = parseInt((req.body || {}).expiresInDays, 10);
+    const invites = loadInvites();
+    if (Object.keys(invites).length >= 200) return res.status(400).json({ status: 'error', message: 'Too many invite codes. Delete some first.' });
+    const code = generateInviteCode();
+    invites[code] = {
+        createdAt: Date.now(),
+        createdBy: req.session.user.username,
+        uses: 0,
+        maxUses: (Number.isFinite(maxUses) && maxUses > 0) ? Math.min(maxUses, 999) : null,
+        expiresAt: (Number.isFinite(days) && days > 0) ? Date.now() + days * 24 * 60 * 60 * 1000 : null,
+        revoked: false
+    };
+    saveInvites(invites);
+    console.log(`[Invites] Created ${code} by ${req.session.user.username}`);
+    res.json({ status: 'ok', code, invite: invites[code] });
+});
+app.post('/api/admin/invites/revoke', requireUser, requireAdmin, (req, res) => {
+    const code = String((req.body || {}).code || '').trim().toUpperCase();
+    const invites = loadInvites();
+    if (!invites[code]) return res.status(404).json({ status: 'error', message: 'Unknown invite code.' });
+    invites[code].revoked = true;
+    saveInvites(invites);
+    console.log(`[Invites] Revoked ${code} by ${req.session.user.username}`);
+    res.json({ status: 'ok' });
+});
+app.post('/api/admin/invites/delete', requireUser, requireAdmin, (req, res) => {
+    const code = String((req.body || {}).code || '').trim().toUpperCase();
+    const invites = loadInvites();
+    if (!invites[code]) return res.status(404).json({ status: 'error', message: 'Unknown invite code.' });
+    delete invites[code];
+    saveInvites(invites);
+    console.log(`[Invites] Deleted ${code} by ${req.session.user.username}`);
+    res.json({ status: 'ok' });
+});
 
 app.get('/api/status', apiLimiter, requireUser, (req, res) => {
     const username = req.session.user.username;
