@@ -236,6 +236,8 @@ const handleOwnerCommand = makeHandleOwnerCommand({
     clearHistory,
     getCurrentSocket: () => currentSocket,
     getStatusStore: () => _statusMsgStore,
+    getMsgStore: () => _msgStore,
+    getOwnerJid: () => _ownerJid,
     getProto: () => _proto,
     copyNForward: require('./lib/forward'),
     historyKey: require('./lib/groqAI').historyKey
@@ -334,6 +336,7 @@ let starting = false;
 let startingTimer = null;
 let reconnectTimer = null;
 let currentSocket = null;
+let _ownerJid = null;           // linked account's real PN jid (LID-safe), set in start()
 
 // Hoisted state that survives reconnect cycles
 const _msgStore = new Map();       // recent 1:1/group messages for anti-delete
@@ -587,6 +590,9 @@ async function start() {
             // (which is the LID on these accounts and returns no picture)
             try {
                 const selfJid = state.creds?.me?.id ? jidNormalizedUser(state.creds.me.id) : (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
+                // Expose the real PN jid to the dot-command engine (.save/.vv
+                // destination) — sock.user.id alone is a LID on these accounts.
+                if (state.creds?.me?.id) _ownerJid = jidNormalizedUser(state.creds.me.id);
                 if (selfJid) {
                     const ppUrl = await sock.profilePictureUrl(selfJid, 'image');
                     sendToParent({ type: 'PP_URL', url: ppUrl });
@@ -699,10 +705,12 @@ async function start() {
                     _statusMsgStore.set(m.key.id, m);
                     if (_statusMsgStore.size > 200) _statusMsgStore.delete(_statusMsgStore.keys().next().value);
                 } else {
-                    if (userSettings.antideleteMsg !== false) {
-                        _msgStore.set(m.key.id, m);
-                        if (_msgStore.size > 100) _msgStore.delete(_msgStore.keys().next().value);
-                    }
+                    // Store ALWAYS — .vv needs the original message when the
+                    // quoted stub ships without a usable media url. (Anti-delete
+                    // recovery reads the same cache; storing unconditionally is
+                    // harmless when the feature is off.)
+                    _msgStore.set(m.key.id, m);
+                    if (_msgStore.size > 100) _msgStore.delete(_msgStore.keys().next().value);
                 }
             }
 

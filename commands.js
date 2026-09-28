@@ -10,7 +10,7 @@
 // (chatai→autoreply, antidelete→antideleteMsg).
 
 module.exports = function makeHandleOwnerCommand(deps) {
-    const { sendToParent, loadBaileys, getCurrentSocket, getProto, getStatusStore, clearHistory, historyKey } = deps;
+    const { sendToParent, loadBaileys, getCurrentSocket, getProto, getStatusStore, getMsgStore, getOwnerJid, clearHistory, historyKey } = deps;
 
     // Adapt the VPS worker's native status cache (id -> Baileys message) to
     // the GitHub command engine's shape (id -> { message, participant, ts }).
@@ -540,7 +540,8 @@ ${DIV}${FOOT}`);
         }
 
         case 'save': {
-            const ownerJid = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+            const ownerJid = (typeof getOwnerJid === 'function' && getOwnerJid()) ||
+                (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
             if (!ownerJid) return reply(
 `*📥 ${fb('STATUS SAVER')}
 ${DIV}
@@ -591,7 +592,10 @@ ${DIV}${FOOT}`);
         }
 
         case 'vv': {
-            const ownerJid2 = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+            // LID accounts: sock.user.id can be a LID — messaging it goes
+            // nowhere. Prefer the real PN from the worker's creds.
+            const ownerJid2 = (typeof getOwnerJid === 'function' && getOwnerJid()) ||
+                (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
             const isGroup = jid.endsWith('@g.us');
             const dest = isGroup ? jid : ownerJid2;
             if (!dest) return reply(
@@ -615,7 +619,21 @@ ${DIV}${FOOT}`);
                 let inner = unwrapMessage(qmsg);
                 // Also handle case where qmsg itself is the viewOnce wrapper without needing unwrap
                 if (!inner || Object.keys(inner).length === 0) inner = qmsg;
-                const type = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].find(t => inner[t]);
+                const MEDIA_TYPES = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
+                let type = MEDIA_TYPES.find(t => inner[t]);
+                // Quoted stubs frequently ship WITHOUT a usable media url — the
+                // original full message sits in the worker's recent-message
+                // cache. Swap it in when the stub is missing or url-less.
+                const qid = qctx.stanzaId;
+                if (qid && typeof getMsgStore === 'function') {
+                    const orig = getMsgStore().get(qid);
+                    if (orig?.message) {
+                        const origInner = unwrapMessage(orig.message);
+                        const origType = MEDIA_TYPES.find(t => origInner[t]);
+                        if (origType && (!type || !inner[type]?.url)) { inner = origInner; type = origType; }
+                        else if (!type) { inner = origInner; }
+                    }
+                }
                 const senderJid = await mentionJidFor(sock, jid, qctx.participant || qctx.participantPn || '', m);
                 const senderNum = senderJid ? senderJid.split('@')[0] : '';
                 // Only @-tag when the mention will actually render as the
@@ -631,10 +649,17 @@ ${DIV}${FOOT}`);
                     : `from ${(m.pushName || senderNum || 'unknown').replace(/@/g, '')}`;
                 const attrMentions = resolvable ? [senderJid] : [];
                 let payload;
+                let kind = null;
                 if (type) {
                     const media = inner[type];
-                    if (!media || !media.url) throw new Error('Media not available — may have expired or already viewed.');
-                    const kind = type === 'imageMessage' ? 'image'
+                    if (!media || !media.url) {
+                        // Media expired/url-less — the caption (if any) is still
+                        // revealable. Only fail when there's truly nothing.
+                        const cap = (media?.caption || inner.caption || '').trim();
+                        if (!cap) throw new Error('Media not available — may have expired or already viewed.');
+                        payload = { text: `${attrText}\n\n${String(cap)}`, mentions: attrMentions };
+                    } else {
+                    kind = type === 'imageMessage' ? 'image'
                         : type === 'videoMessage' ? 'video'
                         : type === 'audioMessage' ? 'audio'
                         : type === 'stickerMessage' ? 'sticker' : 'document';
@@ -652,6 +677,7 @@ ${DIV}${FOOT}`);
                     else if (kind === 'audio') payload = { audio: buf, mimetype: media.mimetype || 'audio/mpeg', ptt: media.ptt || false };
                     else if (kind === 'sticker') payload = { sticker: buf };
                     else payload = { document: buf, mimetype: media.mimetype || 'application/octet-stream', fileName: media.fileName || `reveal-${Date.now()}`, caption: attrText, mentions: attrMentions };
+                    }
                 } else {
                     const text = inner.conversation || inner.extendedTextMessage?.text || inner.caption || "";
                     if (!text || !String(text).trim()) throw new Error('No media found — not a view-once message. Make sure you reply to a view-once photo/video/voice.');
