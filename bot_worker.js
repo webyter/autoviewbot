@@ -856,8 +856,13 @@ async function start() {
                             // Mention the target's REAL phone jid (prefer the group
                             // roster's pn entry) so @mentions show names, not digits
                             const targetPnGA = target ? ((metaGA.participants.find(p=> jidNormalizedUser(p.id)===target || (p.lid && jidNormalizedUser(p.lid)===target)) || {}).id || target) : target;
-                            if (!isSenderAdminGA) continue;
-                            if (!isBotAdminGA) continue;
+                            // Sender or bot lacks group admin rights — don't swallow
+                            // the message. Fall through to the owner command engine
+                            // below (4.5), which re-checks authorization itself. The
+                            // old `continue` here killed owner commands (.antilink,
+                            // .tagall, .kick) whenever the owner's phone wasn't in
+                            // the group's admin roster.
+                            if (isSenderAdminGA && isBotAdminGA) {
                             if (cmd==='promote' && target) { await sock.groupParticipantsUpdate(jid, [target], 'promote'); await sock.sendMessage(jid, {text: `✅ Promoted @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
                             else if (cmd==='demote' && target) { await sock.groupParticipantsUpdate(jid, [target], 'demote'); await sock.sendMessage(jid, {text: `✅ Demoted @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
                             else if ((cmd==='kick'||cmd==='remove') && target) { await sock.groupParticipantsUpdate(jid, [target], 'remove'); await sock.sendMessage(jid, {text: `✅ Removed @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
@@ -873,6 +878,7 @@ async function start() {
                                 else if (sub==='off') { userSettings.antilink=false; sendToParent({ type: 'UPDATE_SETTINGS', changes: { antilink: false } }); await sock.sendMessage(jid,{text:'🔗 Anti-Link OFF'});  }
                                 else await sock.sendMessage(jid,{text:'Usage: .antilink on/off (also dashboard toggle)'});
                             }
+                            } // end admin-gated group command chain
                         } catch(e){ console.error('[GroupAdmin] error', e.stack||e); }
                         // do not fallthrough to autoreply for commands
                         continue;

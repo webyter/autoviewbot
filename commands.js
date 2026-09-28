@@ -47,7 +47,8 @@ module.exports = function makeHandleOwnerCommand(deps) {
     const KEYMAP = {
         chatai: 'autoreply',
         antidelete: 'antideleteMsg',
-        persona: 'botInstructions'
+        persona: 'botInstructions',
+        antitag: 'antiTagStatus'
     };
     const userSettings = new Proxy(deps.userSettings, {
         get(t, k) { return (typeof k === 'string') ? t[KEYMAP[k] || k] : t[k]; },
@@ -107,7 +108,7 @@ async function senderNumber(m, jid) {
 async function isGroupAdmin(sock, jid, num) {
     try {
         const meta = await sock.groupMetadata(jid);
-        const p = (meta?.participants || []).find(pt => numMatch(pt.id, num));
+        const p = (meta?.participants || []).find(pt => numMatch(pt.id, num) || (pt.lid && numMatch(pt.lid, num)));
         return !!(p && (p.admin === 'admin' || p.admin === 'superadmin' || p.isSuperAdmin));
     } catch { return false; }
 }
@@ -362,7 +363,6 @@ ${DIV}${FOOT}`);
         case 'groupadmin':
         case 'chatai': {
             const v = (parts[0] || '').toLowerCase();
-            if (v !== 'on' && v !== 'off') return;
             const keyMap = {
                 autostatus: 'autostatus',
                 antidelete: 'antidelete',
@@ -375,6 +375,12 @@ ${DIV}${FOOT}`);
                 autoreply: 'autoreply'
             };
             const settingKey = keyMap[cmd] || cmd;
+            // No/bad argument: show state + usage instead of silence.
+            if (v !== 'on' && v !== 'off') return reply(
+`⚙️ *${fb(cmd.toUpperCase())}* is ${onOff(userSettings[settingKey])}
+${DIV}
+Usage: \`.${cmd} on\` or \`.${cmd} off\`
+${DIV}${FOOT}`);
             apply({ [settingKey]: v === 'on' },
 `${v === 'on' ? '✅' : '⛔'} *${fb(cmd.toUpperCase())} ${fb(v.toUpperCase())}*
 ${DIV}
@@ -409,7 +415,11 @@ ${DIV}${FOOT}`);
 
         case 'statusreact': {
             const v = (parts[0] || '').toLowerCase();
-            if (v !== 'on' && v !== 'off') return;
+            if (v !== 'on' && v !== 'off') return reply(
+`⚙️ *${fb('STATUS REACT')}* is ${onOff(userSettings.statusReact)}
+${DIV}
+Usage: \`.statusreact on\` or \`.statusreact off\`
+${DIV}${FOOT}`);
             apply({ statusReact: v === 'on' },
 `${v === 'on' ? '✅' : '⛔'} *${fb('STATUS REACT')} ${fb(v.toUpperCase())}*
 ${DIV}
@@ -425,7 +435,12 @@ ${DIV}${FOOT}`);
             const list = Array.isArray(userSettings[cmd]) ? [...userSettings[cmd]] : [];
             const head = cmd === 'allow' ? '💬 ' + fb('ALLOW LIST') : '🚫 ' + fb('BLOCK LIST');
             if (action === 'add') {
-                if (num.length < 7) return;
+                if (num.length < 7) return reply(
+`*➕ ${head}*
+${DIV}
+Send a full number (min 7 digits).
+_Example: \`.${cmd} add 233201234567\`_
+${DIV}${FOOT}`);
                 if (!list.some(n => numMatch(n, num))) list.push(num);
                 apply({ [cmd]: list },
 `*➕ ${head}*
@@ -434,9 +449,18 @@ ${DIV}
 Total: *${list.length}* contact${list.length === 1 ? '' : 's'}
 ${DIV}${FOOT}`);
             } else if (action === 'del' || action === 'remove') {
-                if (num.length < 7) return;
+                if (num.length < 7) return reply(
+`*➖ ${head}*
+${DIV}
+Send a full number (min 7 digits).
+_Example: \`.${cmd} del 233201234567\`_
+${DIV}${FOOT}`);
                 const next = list.filter(n => !numMatch(n, num));
-                if (next.length === list.length) break;
+                if (next.length === list.length) return reply(
+`*➖ ${head}*
+${DIV}
+\`+${num}\` isn't on the list.
+${DIV}${FOOT}`);
                 apply({ [cmd]: next },
 `*➖ ${head}*
 ${DIV}
@@ -472,7 +496,12 @@ ${DIV}${FOOT}`);
 ${DIV}
 Reset to default ✅
 ${DIV}${FOOT}`);
-            if (text.length > 300) return;
+            if (text.length > 300) return reply(
+`*🎭 ${fb('PERSONA')}*
+${DIV}
+Too long — 300 characters max.
+_Yours: ${text.length}._
+${DIV}${FOOT}`);
             apply({ persona: text },
 `*🎭 ${fb('PERSONA SET')} ✅
 ${DIV}
@@ -526,6 +555,8 @@ to your chats.
 ${DIV}${FOOT}`);
             } catch (e) {
                 console.error('[Cmd] status save failed:', e.message);
+                await reply(`*⚠️ ${fb('SAVE FAILED')}*
+\`${e.message}\``).catch(() => {});
             }
             break;
         }
@@ -612,7 +643,15 @@ ${DIV}${FOOT}`);
             }
             const num = (parts[1] || '').replace(/\D/g, '');
             if ((action !== 'add' && action !== 'del') || !num || num.length < 6) {
-                // silent
+                // Owner-only command — show the list + usage instead of silence.
+                await reply(
+`*👑 ${fb('ADMIN LIST')} (${list.length})
+${DIV}
+${list.length ? list.map(n => `\`+${n}\``).join('\n') : '_empty — only the linked phone runs commands_'}
+${DIV}
+_Add:_ \`.admin add 233201234567\`
+_Remove:_ \`.admin del 233201234567\`
+${DIV}${FOOT}`);
                 break;
             }
             const next = action === 'add'
@@ -649,7 +688,13 @@ ${DIV}${FOOT}`);
             }
             targetJids = targetJids.map(j => j.includes('@') ? j : `${j}@s.whatsapp.net`);
             if (!targetJids.length) {
-                // silent
+                await reply(
+`*${fb(cmd.toUpperCase())}*
+${DIV}
+Tag someone, reply to their message,
+or type the number.
+_Example: \`.${cmd} @user\`_
+${DIV}${FOOT}`);
                 break;
             }
             try {
