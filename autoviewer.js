@@ -336,7 +336,16 @@ if (!effectiveSecret) {
         console.warn('[Manager] ⚠️ WARNING: Using generated session secret. Set SESSION_SECRET for production persistence.');
     }
 }
+// ── Session store (audit M4) ─────────────────────────────────────────────────
+// File-backed store instead of the leaky MemoryStore: sessions survive
+// restarts on a persistent disk and expired ones get swept.
+const { FileSessionStore } = require('./lib/session-store');
+const sessionStore = new FileSessionStore({
+    dir: require('path').join(__dirname, 'session', 'sessions'),
+    ttl: 24 * 60 * 60 * 1000
+});
 app.use(session({
+    store: sessionStore,
     secret: effectiveSecret,
     resave: false,
     saveUninitialized: false,
