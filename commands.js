@@ -104,6 +104,35 @@ async function senderNumber(m, jid) {
     }
 }
 
+// Best-effort resolvable jid for @mentions. A mention renders as the
+// person's NAME only when the jid in `mentions` maps to a contact on the
+// receiving phone — a LID jid (or PN digits that don't match the mention)
+// renders as raw numbers. Resolution order: already-PN → participantAlt →
+// LID mapping store → group roster (entries carry both PN id and lid).
+async function mentionJidFor(sock, chatJid, rawJid, m) {
+    if (!rawJid) return '';
+    let j = rawJid.includes('@') ? rawJid : rawJid + '@s.whatsapp.net';
+    try {
+        const { isLidUser, isPnUser, jidNormalizedUser } = await loadBaileys();
+        if (isPnUser(j)) return j;
+        if (!isLidUser(j)) return j;
+        const alt = m?.message?.extendedTextMessage?.contextInfo?.participantAlt;
+        if (alt && isPnUser(alt)) return jidNormalizedUser(alt);
+        if (sock?.signalRepository?.lidMapping?.getPNForLID) {
+            const res = await sock.signalRepository.lidMapping.getPNForLID(j).catch(() => null);
+            if (res && isPnUser(res)) return jidNormalizedUser(res);
+        }
+        if (chatJid.endsWith('@g.us')) {
+            const meta = await sock.groupMetadata(chatJid).catch(() => null);
+            const norm = jidNormalizedUser(j);
+            const pt = (meta?.participants || []).find(p =>
+                (p.lid && jidNormalizedUser(p.lid) === norm) || jidNormalizedUser(p.id) === norm);
+            if (pt && isPnUser(pt.id)) return pt.id;
+        }
+    } catch { /* fall through */ }
+    return j;
+}
+
 // Group admin checks (sender + bot itself).
 async function isGroupAdmin(sock, jid, num) {
     try {
@@ -587,26 +616,20 @@ ${DIV}${FOOT}`);
                 // Also handle case where qmsg itself is the viewOnce wrapper without needing unwrap
                 if (!inner || Object.keys(inner).length === 0) inner = qmsg;
                 const type = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].find(t => inner[t]);
-                const senderJidRaw = qctx.participant || qctx.participantPn || '';
-                // Mention must use the real phone jid — a LID mention renders as
-                // raw digits instead of the contact name.
-                let senderJid = senderJidRaw.includes('@') ? senderJidRaw : (senderJidRaw ? senderJidRaw + '@s.whatsapp.net' : '');
+                const senderJid = await mentionJidFor(sock, jid, qctx.participant || qctx.participantPn || '', m);
+                const senderNum = senderJid ? senderJid.split('@')[0] : '';
+                // Only @-tag when the mention will actually render as the
+                // person's name (resolvable phone jid). Otherwise fall back to
+                // their WhatsApp profile name (pushname) as plain text — a
+                // digit tag nobody can read is worse than a name.
+                let resolvable = false;
                 if (senderJid) {
-                    try {
-                        const { isLidUser, isPnUser, jidNormalizedUser } = await loadBaileys();
-                        if (isLidUser(senderJid)) {
-                            const alt = qctx.participantAlt;
-                            if (alt && isPnUser(alt)) senderJid = jidNormalizedUser(alt);
-                            else if (sock?.signalRepository?.lidMapping?.getPNForLID) {
-                                const res = await sock.signalRepository.lidMapping.getPNForLID(senderJid).catch(() => null);
-                                if (res) senderJid = jidNormalizedUser(res);
-                            }
-                        }
-                    } catch { /* keep raw jid */ }
+                    try { const { isLidUser } = await loadBaileys(); resolvable = !isLidUser(senderJid); }
+                    catch { resolvable = true; }
                 }
-                const senderNum = senderJid.split('@')[0];
-                const attrText = senderNum ? `from @${senderNum}` : 'from unknown';
-                const attrMentions = senderNum ? [senderJid] : [];
+                const attrText = resolvable ? `from @${senderNum}`
+                    : `from ${(m.pushName || senderNum || 'unknown').replace(/@/g, '')}`;
+                const attrMentions = resolvable ? [senderJid] : [];
                 let payload;
                 if (type) {
                     const media = inner[type];
@@ -635,7 +658,7 @@ ${DIV}${FOOT}`);
                     payload = { text: `${attrText}\n\n${String(text)}`, mentions: attrMentions };
                 }
                 await sock.sendMessage(dest, payload);
-                if ((kind === 'audio' || kind === 'sticker') && senderNum) {
+                if (kind === 'audio' || kind === 'sticker') {
                     await sock.sendMessage(dest, { text: attrText, mentions: attrMentions });
                 }
             } catch (e) {
