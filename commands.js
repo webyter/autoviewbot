@@ -572,37 +572,26 @@ ${DIV}${FOOT}`);
                     for await (const chunk of stream) chunks.push(chunk);
                     const buf = Buffer.concat(chunks);
                     if (buf.length === 0) throw new Error('Downloaded media is empty — may have expired.');
-                    if (kind === 'image') payload = { image: buf, caption: `🔓 _view-once revealed — from ${tag}_` };
-                    else if (kind === 'video') payload = { video: buf, caption: `🔓 _view-once revealed — from ${tag}_` };
+                    // Silent reveal (Samuel): media goes out bare — no 🔓 caption
+                    if (kind === 'image') payload = { image: buf };
+                    else if (kind === 'video') payload = { video: buf };
                     else if (kind === 'audio') payload = { audio: buf, mimetype: media.mimetype || 'audio/mpeg', ptt: media.ptt || false };
                     else if (kind === 'sticker') payload = { sticker: buf };
                     else payload = { document: buf, mimetype: media.mimetype || 'application/octet-stream', fileName: media.fileName || `reveal-${Date.now()}` };
                 } else {
                     const text = inner.conversation || inner.extendedTextMessage?.text || inner.caption || "";
                     if (!text || !String(text).trim()) throw new Error('No media found — not a view-once message. Make sure you reply to a view-once photo/video/voice.');
-                    payload = { text: `🔓 _view-once revealed — from ${tag}_\n\`\`\`\n${text}\n\`\`\`` };
+                    payload = { text: String(text) };
                 }
                 await sock.sendMessage(dest, payload);
-                if (!isGroup && dest !== jid) {
-                    await sock.sendMessage(dest, { text:
-`*🔓 ${fb('VIEW-ONCE')}
-${DIV}
-From: ${tag}
-_Media above — delivered here._
-${DIV}${FOOT}` }).catch(() => {});
-                }
             } catch (e) {
                 console.error('[Cmd] reveal failed:', e.message);
-                // Never leak bot output into a contact's chat — dest is either
-                // the group itself or the owner's own chat, so failing there is
-                // safe. Silence here would just look like the bot ignoring .vv.
-                try {
-                    await sock.sendMessage(dest, { text:
-`*🔓 ${fb('VIEW-ONCE')} — FAILED*
-${DIV}
-${e.message}
-${DIV}${FOOT}` });
-                } catch (e2) { console.error('[Cmd] reveal feedback failed:', e2.message); }
+                // Silent mode: in groups a failure post would blow the cover —
+                // console only. In the owner's own chat a terse one-liner is
+                // sent so a silent failure isn't mistaken for a dead bot.
+                if (!isGroup) {
+                    try { await sock.sendMessage(dest, { text: `vv failed: ${e.message}` }); } catch (e2) { console.error('[Cmd] reveal feedback failed:', e2.message); }
+                }
             }
             break;
         }
