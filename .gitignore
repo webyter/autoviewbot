@@ -4,3 +4,4 @@ config.env
 *.log
 session/
 data/users.json
+server-config.json

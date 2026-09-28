@@ -17,7 +17,7 @@ To host this platform on Render, follow these steps:
 
 1. **GitHub**: Push this code to your GitHub repository.
 2. **Deploy**: Click the "Deploy to Render" button or create a new "Web Service".
-3. **Persistence**: On the **free plan** Render has no persistent disk — every restart or deploy wipes the filesystem, logging users out. For real use, host on a VPS (see below) or a paid plan with a Persistent Disk (Mount Path: `/home/graile/autoviewbot/session`). The built-in keep-alive (self-pings `/health` via `PUBLIC_URL` or `RENDER_EXTERNAL_URL`) prevents the free tier's 15-min idle sleep.
+3. **Persistence**: On the **free plan** Render has no persistent disk — every restart or deploy wipes the filesystem, logging users out. For real use, host on a VPS (see below) or a paid plan with a Persistent Disk (Mount Path: `/opt/render/project/src/session`). The built-in keep-alive (self-pings `/health` via `PUBLIC_URL` or `RENDER_EXTERNAL_URL`) prevents the free tier's 15-min idle sleep.
 
 ## Hosting on a VPS
 ```bash

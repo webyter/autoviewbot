@@ -362,10 +362,14 @@ async function start() {
     // Reload settings in case they changed while we were disconnected
     refreshSettings();
 
-    // Fetch latest WA Web version to avoid 405 (client_too_old) rejection
+    // Fetch latest WA Web version to avoid 405 (client_too_old) rejection.
+    // Hard 15s cap — a hanging fetch must not stall connection startup.
     let waVersion;
     try {
-        const result = await Baileys.fetchLatestWaWebVersion();
+        const result = await Promise.race([
+            Baileys.fetchLatestWaWebVersion(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('version fetch timed out after 15s')), 15000))
+        ]);
         waVersion = result.version;
         console.log(`[Worker:${userId}] WA Web version: ${waVersion ? waVersion.join('.') : 'using default'}`);
     } catch (e) {
@@ -847,8 +851,8 @@ async function start() {
                             else if (cmd==='hidetag' && args.slice(1).join(' ').trim()) { const txtH=args.slice(1).join(' '); await sock.sendMessage(jid, {text: txtH, mentions: metaGA.participants.map(p=>p.id)}); }
                             else if (cmd==='antilink') {
                                 const sub=args[1]?.toLowerCase();
-                                if (sub==='on') { userSettings.antilink=true; await sock.sendMessage(jid,{text:'🔗 Anti-Link ON'});  }
-                                else if (sub==='off') { userSettings.antilink=false; await sock.sendMessage(jid,{text:'🔗 Anti-Link OFF'});  }
+                                if (sub==='on') { userSettings.antilink=true; sendToParent({ type: 'UPDATE_SETTINGS', changes: { antilink: true } }); await sock.sendMessage(jid,{text:'🔗 Anti-Link ON'});  }
+                                else if (sub==='off') { userSettings.antilink=false; sendToParent({ type: 'UPDATE_SETTINGS', changes: { antilink: false } }); await sock.sendMessage(jid,{text:'🔗 Anti-Link OFF'});  }
                                 else await sock.sendMessage(jid,{text:'Usage: .antilink on/off (also dashboard toggle)'});
                             }
                         } catch(e){ console.error('[GroupAdmin] error', e.stack||e); }
@@ -939,11 +943,10 @@ async function start() {
                     /@\s*(all|everyone|group)/i.test(text);
                 if (hasGroupTag) {
                     const senderJid = (await resolveAuthorJid(sock, m.key)) || m.key.participant || m.key.remoteJid;
-                    // Silent delete — no public warning, no chatter.
-                    try {
-                        await sock.sendMessage(jid, { delete: m.key });
-                        console.log(`[Anti-Tag] Deleted status with group tag from ${senderJid?.split('@')[0] || 'unknown'}`);
-                    } catch (e) { console.error('[Anti-Tag] Delete error:', e.message); }
+                    // Status revokes target someone ELSE's status update — WhatsApp
+                    // rejects those (we don't own the message), so the old delete
+                    // call was a guaranteed failure. Log it; no fake action.
+                    console.log(`[Anti-Tag] Status with group tag detected from ${senderJid?.split('@')[0] || 'unknown'} (statuses cannot be revoked by the bot)`);
                     continue;
                 }
             }
@@ -972,11 +975,26 @@ async function start() {
                               m.message.documentMessage?.caption || "";
 
                 // Voice notes: no text → transcribe, then let the AI reply.
-                // Only real voice notes (ptt), only DMs. Inherits allow/block
-                // gates below. Media download retries: WhatsApp frequently
-                // serves the media URL before it's usable.
+                // Allow/block gates FIRST (managed via .allow / .block dot
+                // commands). Block always wins; empty allow = reply to everyone.
+                // Gating before the voice block saves a download+transcription
+                // for senders who would be skipped anyway.
+                const gateNum = (n) => String(n || '').replace(/\D/g, '').replace(/^00233/, '').replace(/^233/, '').replace(/^0/, '');
+                // Resolve LID jids to the real phone number BEFORE list matching —
+                // allow/block hold phone numbers, and on LID accounts the DM jid /
+                // group participant is a @lid whose digits match nothing.
+                const rawSender = (jid.endsWith('@g.us') || jid === 'status@broadcast') ? (m.key?.participant || '') : (m.key?.remoteJid || jid);
+                const resolvedSender = await resolveAuthorJid(sock, m.key) || rawSender;
+                const senderNum = String(resolvedSender).split('@')[0];
+                const allowList = Array.isArray(userSettings.allow) ? userSettings.allow : [];
+                const blockList = Array.isArray(userSettings.block) ? userSettings.block : [];
+                const gateAllowed = !blockList.some(n => gateNum(n) && gateNum(n) === gateNum(senderNum)) &&
+                    !(allowList.length > 0 && !allowList.some(n => gateNum(n) === gateNum(senderNum)));
+
+                // Only real voice notes (ptt), only DMs. Media download retries:
+                // WhatsApp frequently serves the media URL before it's usable.
                 let voiceText = "";
-                if (!msgText.trim() && !jid.endsWith('@g.us') && m.message.audioMessage?.ptt === true && m.message.audioMessage?.url) {
+                if (gateAllowed && !msgText.trim() && !jid.endsWith('@g.us') && m.message.audioMessage?.ptt === true && m.message.audioMessage?.url) {
                     try {
                         await sock.sendPresenceUpdate('recording', jid).catch(() => {});
                         const { downloadContentFromMessage } = await loadBaileys();
@@ -1003,19 +1021,7 @@ async function start() {
                 }
                 const chatInput = (msgText.trim() || voiceText);
 
-                // Allow/block gates (managed via .allow / .block dot commands).
-                // Block always wins; empty allow = reply to everyone.
-                const gateNum = (n) => String(n || '').replace(/\D/g, '').replace(/^00233/, '').replace(/^233/, '').replace(/^0/, '');
-                // Resolve LID jids to the real phone number BEFORE list matching —
-                // allow/block hold phone numbers, and on LID accounts the DM jid /
-                // group participant is a @lid whose digits match nothing.
-                const rawSender = (jid.endsWith('@g.us') || jid === 'status@broadcast') ? (m.key?.participant || '') : (m.key?.remoteJid || jid);
-                const resolvedSender = await resolveAuthorJid(sock, m.key) || rawSender;
-                const senderNum = String(resolvedSender).split('@')[0];
-                const allowList = Array.isArray(userSettings.allow) ? userSettings.allow : [];
-                const blockList = Array.isArray(userSettings.block) ? userSettings.block : [];
-                if (blockList.some(n => gateNum(n) && gateNum(n) === gateNum(senderNum))) continue;
-                if (allowList.length > 0 && !allowList.some(n => gateNum(n) === gateNum(senderNum))) continue;
+                if (!gateAllowed) continue;
 
                 if (chatInput) {
                     const isGroup = jid.endsWith('@g.us');
@@ -1117,6 +1123,9 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', (err) => {
     console.error('[Worker] Uncaught Exception:', err);
+    // Exit so the manager's crash tracking + restart logic takes over —
+    // a half-dead worker that keeps "running" is worse than a clean crash.
+    process.exit(1);
 });
 
 // ── Signal Handling ─────────────────────────────────────────────────────────

@@ -124,7 +124,7 @@ const MAX_INSTANCES_FILE = path.join(__dirname, 'server-config.json');
 // command engine and are mapped in UPDATE_SETTINGS below.
 const WORKER_EDITABLE_KEYS = ['autoreply', 'chatai', 'antideleteMsg', 'antidelete', 'antideleteStatus', 'antiTagStatus', 'autostatus', 'statusReact', 'groupAdmin', 'reactEmojis', 'antilink', 'allow', 'block', 'persona', 'admins', 'mode'];
 function loadMaxInstances() {
-    const env = Math.min(parseInt(process.env.MAX_INSTANCES || '5') || 5, 20);
+    const env = Math.min(parseInt(process.env.MAX_INSTANCES || '5') || 5, 50);
     try {
         const c = JSON.parse(fs.readFileSync(MAX_INSTANCES_FILE, 'utf8'));
         if (Number.isFinite(c.maxInstances)) return Math.min(Math.max(1, c.maxInstances | 0), 50);
@@ -229,6 +229,7 @@ function startUserBot(username, clearSession = false) {
                         inst.qrDataUrl = null;
                         inst.errorMsg = null;
                         lastQrCache.delete(username);
+                        wipeCounts.delete(username);
                         clearStartupWatchdog(username);
                     }
                     break;
@@ -321,15 +322,28 @@ function startUserBot(username, clearSession = false) {
                     console.log(`[Manager] Restarting ${username} in 3s${clearSession ? ' (clearing session)' : ''}...`);
                     const tid = setTimeout(() => {
                         pendingRestarts.delete(username);
-                        const db2 = loadDB();
+                        let db2;
+                        try { db2 = loadDB(); } catch (e) {
+                            console.error(`[Manager] DB unreadable during restart of ${username}:`, e.message);
+                            return;
+                        }
                         if (db2[username]?.running) {
-                            startUserBot(username, clearSession);
+                            const started = startUserBot(username, clearSession);
+                            if (started === 'capacity') {
+                                // Slots filled while we waited — don't strand a
+                                // ghost "running" state the dashboard can't start
+                                console.log(`[Manager] ${username} restart aborted: capacity full. Marking stopped.`);
+                                dbTransaction((db) => { if (db[username]) db[username].running = false; });
+                            }
                         } else {
                             console.log(`[Manager] ${username} was stopped during restart delay. Skipping.`);
                         }
                     }, 3000);
                     pendingRestarts.set(username, tid);
                 }
+            } else {
+                // No restart coming — a cached QR for a dead worker is stale
+                lastQrCache.delete(username);
             }
         });
 
@@ -1171,13 +1185,18 @@ app.get('/login', (req, res) => {
     res.send(loginPage('', req));
 });
 
-app.post('/login', loginLimiter, ah(async (req, res) => {
-    const { username, password } = req.body || {};
+// Pre-computed hash so the login handler always runs one bcrypt compare —
+// unknown usernames must be indistinguishable from wrong passwords by timing.
+const DUMMY_HASH = bcrypt.hashSync('nova-timing-dummy-pw', 10);
+app.post('/login', loginLimiter, ah(async (req, res) => {    const { username, password } = req.body || {};
     const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
     if (!cleanUser || !isValidUsername(cleanUser) || typeof password !== 'string' || !password || password.length < 6 || password.length > 100) return res.status(401).send(loginPage('Invalid username or password.', req));
     
     const db = loadDB();
-    if (db[cleanUser] && await bcrypt.compare(password, db[cleanUser].password)) {
+    // Always run one bcrypt compare — unknown users must be indistinguishable
+    // from wrong-password users by response timing (user enumeration).
+    const ok = !!db[cleanUser] && await bcrypt.compare(password, db[cleanUser].password || DUMMY_HASH);
+    if (ok) {
         req.session.regenerate(() => {
             req.session.user = { username: cleanUser };
             res.redirect('/');
@@ -1422,7 +1441,7 @@ app.post('/bot/stop', requireUser, ah(async (req, res) => {
     const username = req.session.user.username;
     clearPendingRestart(username);
     clearStartupWatchdog(username);
-    await dbTransaction((db) => { db[username].running = false; });
+    await dbTransaction((db) => { if (!db[username]) return; db[username].running = false; });
     const inst = instances.get(username);
     if (inst && inst.child) {
         inst.child.kill();
@@ -1529,7 +1548,7 @@ app.post('/api/admin/bot/stop', requireUser, requireAdmin, ah(async (req, res) =
     if (!username) return res.status(400).json({ status: 'error', message: 'Invalid user.' });
     clearPendingRestart(username);
     clearStartupWatchdog(username);
-    await dbTransaction((db) => { db[username].running = false; });
+    await dbTransaction((db) => { if (!db[username]) return; db[username].running = false; });
     const inst = instances.get(username);
     if (inst && inst.child) {
         inst.child.kill();
@@ -1565,6 +1584,7 @@ app.post('/api/admin/user/delete', requireUser, requireAdmin, ah(async (req, res
         return res.status(400).json({ status: 'error', message: 'You cannot delete your own account.' });
     }
     const db = loadDB();
+    let deleted = false;
     const isLastAdmin = db[username]?.isAdmin && Object.values(db).filter(u => u.isAdmin).length <= 1;
     if (isLastAdmin) return res.status(400).json({ status: 'error', message: 'Cannot delete the last admin account.' });
 
@@ -1585,11 +1605,22 @@ app.post('/api/admin/user/delete', requireUser, requireAdmin, ah(async (req, res
     startedAtMap.delete(username);
     lastQrCache.delete(username);
 
-    await dbTransaction((db) => { delete db[username]; });
+    await dbTransaction((db) => {
+        if (!db[username]) return;
+        // Recount admins INSIDE the serialized transaction — the pre-transaction
+        // snapshot could race a concurrent delete of the other admin.
+        const isLastAdmin = db[username].isAdmin && Object.values(db).filter(u => u.isAdmin).length <= 1;
+        if (isLastAdmin) return;
+        delete db[username];
+        deleted = true;
+    });
 
     const sessionDir = path.join(SESSION_BASE, username);
     try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {
         console.error(`[Manager] Failed to remove session dir for ${username}:`, e.message);
+    }
+    if (!deleted) {
+        return res.status(400).json({ status: 'error', message: 'Account no longer exists or is the last admin.' });
     }
     console.log(`[Manager] Deleted user ${username}`);
     res.json({ status: 'ok' });
@@ -1980,6 +2011,9 @@ app.get('/api/admin/invites', requireUser, requireAdmin, (req, res) => {
 app.post('/api/admin/invites/create', requireUser, requireAdmin, (req, res) => {
     const maxUses = parseInt((req.body || {}).maxUses, 10);
     const days = parseInt((req.body || {}).expiresInDays, 10);
+    if (Number.isFinite(maxUses) && maxUses < 1) {
+        return res.status(400).json({ status: 'error', message: 'Max uses must be at least 1 (or empty for unlimited).' });
+    }
     let created = null;
     let createdEntry = null;
     let error = null;

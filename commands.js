@@ -250,11 +250,13 @@ async function handleOwnerCommand(sock, body, m, jid) {
     const senderNum = await senderNumber(m, jid);
     const adminList = Array.isArray(userSettings.admins) ? userSettings.admins : [];
     const listedAdmin = !isOwner && adminList.some(n => numMatch(senderNum, n));
-    // .mode public: anyone may run commands. .admin and .mode always stay
-    // owner-only — public mode must never let strangers edit the admin list
-    // or flip the mode back.
+    // .mode public: anyone may run commands. But some commands must NEVER
+    // open up: .admin/.mode (owner-only, no exceptions) and anything that
+    // mutates PERSISTED settings (.allow/.block/.persona) — public mode must
+    // never let strangers poison the allow/block lists or the bot's persona.
     const OWNER_ONLY_CMDS = new Set(['admin', 'mode']);
-    const publicMode = !isOwner && userSettings.mode === 'public' && !OWNER_ONLY_CMDS.has(cmd);
+    const PERSIST_CMDS = new Set(['allow', 'block', 'persona']);
+    const publicMode = !isOwner && userSettings.mode === 'public' && !OWNER_ONLY_CMDS.has(cmd) && !PERSIST_CMDS.has(cmd);
     // Group admins (not in the list) may only use group moderation commands.
     const MOD_CMDS = new Set(['kick', 'promote', 'demote', 'mute', 'unmute', 'tagall']);
     if (MOD_CMDS.has(cmd)) {
