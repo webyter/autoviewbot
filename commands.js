@@ -587,8 +587,26 @@ ${DIV}${FOOT}`);
                 // Also handle case where qmsg itself is the viewOnce wrapper without needing unwrap
                 if (!inner || Object.keys(inner).length === 0) inner = qmsg;
                 const type = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'].find(t => inner[t]);
-                const senderNum = (qctx.participant || qctx.participantPn || '').split('@')[0];
-                const tag = senderNum ? `\`+${senderNum}\`` : '_unknown_';
+                const senderJidRaw = qctx.participant || qctx.participantPn || '';
+                // Mention must use the real phone jid — a LID mention renders as
+                // raw digits instead of the contact name.
+                let senderJid = senderJidRaw.includes('@') ? senderJidRaw : (senderJidRaw ? senderJidRaw + '@s.whatsapp.net' : '');
+                if (senderJid) {
+                    try {
+                        const { isLidUser, isPnUser, jidNormalizedUser } = await loadBaileys();
+                        if (isLidUser(senderJid)) {
+                            const alt = qctx.participantAlt;
+                            if (alt && isPnUser(alt)) senderJid = jidNormalizedUser(alt);
+                            else if (sock?.signalRepository?.lidMapping?.getPNForLID) {
+                                const res = await sock.signalRepository.lidMapping.getPNForLID(senderJid).catch(() => null);
+                                if (res) senderJid = jidNormalizedUser(res);
+                            }
+                        }
+                    } catch { /* keep raw jid */ }
+                }
+                const senderNum = senderJid.split('@')[0];
+                const attrText = senderNum ? `from @${senderNum}` : 'from unknown';
+                const attrMentions = senderNum ? [senderJid] : [];
                 let payload;
                 if (type) {
                     const media = inner[type];
@@ -603,18 +621,23 @@ ${DIV}${FOOT}`);
                     for await (const chunk of stream) chunks.push(chunk);
                     const buf = Buffer.concat(chunks);
                     if (buf.length === 0) throw new Error('Downloaded media is empty — may have expired.');
-                    // Silent reveal (Samuel): media goes out bare — no 🔓 caption
-                    if (kind === 'image') payload = { image: buf };
-                    else if (kind === 'video') payload = { video: buf };
+                    // (Samuel) reveals carry a light "from @user" attribution —
+                    // caption where the media supports one, companion line
+                    // otherwise (stickers and voice notes can't hold captions).
+                    if (kind === 'image') payload = { image: buf, caption: attrText, mentions: attrMentions };
+                    else if (kind === 'video') payload = { video: buf, caption: attrText, mentions: attrMentions };
                     else if (kind === 'audio') payload = { audio: buf, mimetype: media.mimetype || 'audio/mpeg', ptt: media.ptt || false };
                     else if (kind === 'sticker') payload = { sticker: buf };
-                    else payload = { document: buf, mimetype: media.mimetype || 'application/octet-stream', fileName: media.fileName || `reveal-${Date.now()}` };
+                    else payload = { document: buf, mimetype: media.mimetype || 'application/octet-stream', fileName: media.fileName || `reveal-${Date.now()}`, caption: attrText, mentions: attrMentions };
                 } else {
                     const text = inner.conversation || inner.extendedTextMessage?.text || inner.caption || "";
                     if (!text || !String(text).trim()) throw new Error('No media found — not a view-once message. Make sure you reply to a view-once photo/video/voice.');
-                    payload = { text: String(text) };
+                    payload = { text: `${attrText}\n\n${String(text)}`, mentions: attrMentions };
                 }
                 await sock.sendMessage(dest, payload);
+                if ((kind === 'audio' || kind === 'sticker') && senderNum) {
+                    await sock.sendMessage(dest, { text: attrText, mentions: attrMentions });
+                }
             } catch (e) {
                 console.error('[Cmd] reveal failed:', e.message);
                 // Silent mode: in groups a failure post would blow the cover —
