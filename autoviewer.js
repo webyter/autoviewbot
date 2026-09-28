@@ -1741,7 +1741,9 @@ app.post('/api/admin/invites/create', requireUser, requireAdmin, (req, res) => {
         const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no I,L,O,0,1 — unambiguous when read aloud
         const part = (n) => Array.from(crypto.randomBytes(n)).map(b => alphabet[b % alphabet.length]).join('');
         let code;
-        do { code = 'INV-' + part(5) + '-' + part(5); } while (invites[code]);
+        // Short link-friendly format: INV-XXXXXX (31^6 ≈ 887M keyspace; register
+        // is rate-limited, and codes are single-use or capped, so this holds up).
+        do { code = 'INV-' + part(6); } while (invites[code]);
         invites[code] = {
             createdAt: Date.now(),
             createdBy: req.session.user.username,
