@@ -10,7 +10,7 @@
 // (chatai→autoreply, antidelete→antideleteMsg).
 
 module.exports = function makeHandleOwnerCommand(deps) {
-    const { sendToParent, loadBaileys, getCurrentSocket, getProto, getStatusStore, clearHistory } = deps;
+    const { sendToParent, loadBaileys, getCurrentSocket, getProto, getStatusStore, clearHistory, historyKey } = deps;
 
     // Adapt the VPS worker's native status cache (id -> Baileys message) to
     // the GitHub command engine's shape (id -> { message, participant, ts }).
@@ -126,21 +126,9 @@ async function botIsGroupAdmin(sock, jid) {
     } catch { return false; }
 }
 
-async function copyNForward(sock, jid, message, forceForward = false, options = {}) {
-    if (!message || !message.message) throw new Error('copyNForward: no message content');
-    const vtype = Object.keys(message.message)[0];
-    const isViewOnce = vtype === 'viewOnceMessage' || vtype === 'viewOnceMessageV2';
-    const content = isViewOnce ? message.message[vtype].message : message.message;
-    
-    return await sock.sendMessage(jid, { 
-        forward: {
-            key: message.key,
-            message: content,
-            forwardContent: true
-        },
-        ...options
-    });
-}
+// Shared forward helper (lib/forward.js) — Baileys rc14 reads `forward`
+// and `force`; `forwardContent` was never a real field.
+const copyNForward = deps.copyNForward;
 
 // ── User Settings ───────────────────────────────────────────────────────────
 // NOTE: groqKey is intentionally NOT here. The Groq key is fixed in code
@@ -304,7 +292,8 @@ ${DIV}${FOOT}`);
         }
 
         case 'clear': {
-            clearHistory(jid);
+            // Per-speaker key must match the one askGroq uses (audit L20)
+            clearHistory(historyKey(jid, m.key.participant));
             await reply(
 `*🧹 ${fb('MEMORY CLEARED')}
 ${DIV}
@@ -465,7 +454,10 @@ ${DIV}${FOOT}`);
         }
 
         case 'persona': {
-            const text = body.slice(1).trim().slice(('persona ').length).trim() || (parts[0] ? parts.join(' ') : '');
+            // (audit L20) parts already has the command shifted off — join the
+            // args directly. The old body.slice().slice() arithmetic produced
+            // garbage for unexpected spacing.
+            const text = parts.join(' ').trim();
             if (!text) return reply(
 `*🎭 ${fb('PERSONA')}
 ${DIV}

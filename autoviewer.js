@@ -200,6 +200,9 @@ function startUserBot(username, clearSession = false) {
 
         child.on('exit', (code, signal) => {
             console.log(`[Manager] Worker for ${username} exited (pid ${child.pid}, code ${code}, signal ${signal}). Active: ${instances.size - (instances.get(username)?.child === child ? 1 : 0)}/${MAX_INSTANCES}`);
+            // (audit L9) the starting lock spans the worker's lifetime — clear
+            // it here so the next start attempt is never locked out
+            startingLock.delete(username);
             const isCurrent = instances.get(username)?.child === child;
             if (isCurrent) {
                 instances.delete(username);
@@ -294,6 +297,10 @@ function startUserBot(username, clearSession = false) {
                     try { inst.child.kill(); } catch (e) {}
                 }
                 instances.delete(username);
+                // (audit L9) the lock now spans the worker lifetime; the killed
+                // child's exit event releases it asynchronously, so clear it
+                // here before the immediate restart
+                startingLock.delete(username);
                 const db = loadDB();
                 if (db[username]?.running) {
                     // Do NOT clear the session — the worker may just be slow to
@@ -304,8 +311,13 @@ function startUserBot(username, clearSession = false) {
             }
         }, 45000);
         startupWatchdogs.set(username, wd);
-    } finally {
+    } catch (e) {
+        // (audit L9) the lock now spans the worker's LIFETIME, not just this
+        // synchronous function — a sync finally made it a no-op. Released in
+        // the child 'exit' handler (and on stop/delete); released here if the
+        // fork itself threw so the account isn't locked out forever.
         startingLock.delete(username);
+        throw e;
     }
     return 'started';
 }
@@ -392,6 +404,14 @@ function requireUser(req, res, next) {
     if (!db[req.session.user.username]) {
         req.session.destroy();
         if (req.path.startsWith('/api')) return res.status(401).json({ status: 'error', message: 'Not authenticated.' });
+        return res.redirect('/login');
+    }
+    // (audit L8) stale-cookie invalidation: when a username re-registers, the
+    // account row is new. A session cookie issued to the PREVIOUS account
+    // holder carries the old createdAt epoch — reject it.
+    if ((db[req.session.user.username].createdAt || 0) !== (req.session.user.createdAt || 0)) {
+        req.session.destroy();
+        if (req.path.startsWith('/api')) return res.status(401).json({ status: 'error', message: 'Session expired. Please sign in again.' });
         return res.redirect('/login');
     }
     next();
@@ -752,15 +772,10 @@ app.get('/', requireUser, (req, res) => {
                     </div>
                 </div>
 
-                <div class="emoji-card">
-                    <label>Persona <span style="text-transform:none;letter-spacing:0">(alternate bot identity for .persona — overrides nothing if empty)</span></label>
-                    <div class="emoji-row">
-                        <textarea id="list-input-persona" maxlength="2000" placeholder="e.g. Kwame, friendly phone shop attendant">${escapeHTML(userData.persona || '')}</textarea>
-                    </div>
-                    <div class="emoji-row" style="margin-top:8px">
-                        <button class="btn btn-primary btn-emojis list-save-btn" data-listkey="persona">Save</button>
-                    </div>
-                </div>
+                <!-- (audit L20) the old "Persona" card wrote db.persona, a key
+                     nothing reads — persona and bot instructions are one key
+                     (dot-command .persona maps persona -> botInstructions), and
+                     the Bot Instructions card below edits it. -->
 
                 <div class="emoji-card">
                     <label>Reaction Emojis</label>
@@ -782,7 +797,10 @@ app.get('/', requireUser, (req, res) => {
             </div>
 
             ${userData.isAdmin ? '<a href="/admin?r=1" class="admin-link">Admin Panel</a>' : ''}
-            <a href="/logout" class="signout">Sign Out</a>
+            <form method="post" action="/logout" style="display:inline;margin:0">
+                <input type="hidden" name="_csrf" value="${csrfToken(req)}">
+                <button type="submit" class="signout" style="border:none;background:none;cursor:pointer;font:inherit;color:inherit;padding:0">Sign Out</button>
+            </form>
         </div>
 
         <script>
@@ -968,7 +986,10 @@ app.post('/login', loginLimiter, ah(async (req, res) => {    const { username, p
     const ok = !!db[cleanUser] && await bcrypt.compare(password, db[cleanUser].password || DUMMY_HASH);
     if (ok) {
         req.session.regenerate(() => {
-            req.session.user = { username: cleanUser };
+            // (audit L8) bind the session to this account INSTANCE — a
+            // re-registered username gets a fresh createdAt, which invalidates
+            // cookies issued to the previous holder
+            req.session.user = { username: cleanUser, createdAt: db[cleanUser].createdAt || 0 };
             res.redirect('/');
         });
         return;
@@ -1044,6 +1065,7 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
         }
         db[cleanUser] = { 
             password: hashed,
+            createdAt: Date.now(), // (audit L8) instance epoch for stale-session invalidation
             autoreply: false,
             antideleteMsg: true,
             antideleteStatus: true,
@@ -1151,7 +1173,7 @@ app.post('/settings/bot-profile', requireUser, ah(async (req, res) => {
     res.json({ status: 'ok' });
 }));
 
-const EDITABLE_LISTS = new Set(['allow', 'block', 'admins', 'persona']);
+const EDITABLE_LISTS = new Set(['allow', 'block', 'admins']);
 app.post('/settings/update-lists', requireUser, ah(async (req, res) => {
     const { key, value } = req.body || {};
     if (!key || !EDITABLE_LISTS.has(key) || typeof value !== 'string') return res.status(400).json({ status: 'error', message: 'Invalid input.' });
@@ -1258,9 +1280,14 @@ app.post('/api/refresh-qr', requireUser, ah(async (req, res) => {
     res.json({ status: 'ok' });
 }));
 
+// (audit L4) logout is now POST + CSRF (the global CSRF middleware covers it) —
+// a cross-site GET can no longer force a sign-out. GET /logout is a no-op
+// redirect so stale bookmarks don't 404.
 app.get('/logout', (req, res) => {
-    req.session.destroy();
     res.redirect('/login');
+});
+app.post('/logout', (req, res) => {
+    req.session.destroy(() => res.redirect('/login'));
 });
 
 // ── Admin ────────────────────────────────────────────────────────────────────
@@ -1375,7 +1402,7 @@ app.post('/api/admin/user/delete', requireUser, requireAdmin, ah(async (req, res
     startedAtMap.delete(username);
     lastQrCache.delete(username);
 
-    await dbTransaction((db) => {
+    const txOk = await dbTransaction((db) => {
         if (!db[username]) return;
         // Recount admins INSIDE the serialized transaction — the pre-transaction
         // snapshot could race a concurrent delete of the other admin.
@@ -1384,16 +1411,25 @@ app.post('/api/admin/user/delete', requireUser, requireAdmin, ah(async (req, res
         delete db[username];
         deleted = true;
     });
+    if (!txOk) {
+        // (audit L7) the transaction errored — the account may still exist and
+        // the worker is already dead. Do NOT report success.
+        return res.status(500).json({ status: 'error', message: 'Delete failed due to a server error. Try again.' });
+    }
 
     const sessionDir = path.join(SESSION_BASE, username);
+    let dirRemoved = true;
     try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {
+        dirRemoved = false;
         console.error(`[Manager] Failed to remove session dir for ${username}:`, e.message);
     }
     if (!deleted) {
         return res.status(400).json({ status: 'error', message: 'Account no longer exists or is the last admin.' });
     }
     console.log(`[Manager] Deleted user ${username}`);
-    res.json({ status: 'ok' });
+    // (audit L7) leftover WhatsApp creds are a real (if secondary) failure —
+    // surface it instead of a clean "ok"
+    res.json(dirRemoved ? { status: 'ok' } : { status: 'ok', warning: 'Account deleted, but its session files could not be removed from disk.' });
 }));
 
 app.get('/api/admin/announcement', requireUser, requireAdmin, (req, res) => {
@@ -1518,7 +1554,7 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                             <button class="btn bg" id="max-save" style="flex:0 0 auto;font-size:12px;padding:7px 12px">Save</button>
                         </div>
                     </div>
-                    <div class="links"><a href="/">Dashboard</a><a href="/logout" class="ghost">Sign Out</a></div>
+                    <div class="links"><a href="/">Dashboard</a><form method="post" action="/logout" style="display:inline;margin:0"><input type="hidden" name="_csrf" value="${csrfToken(req)}"><button type="submit" class="ghost" style="border:none;background:none;cursor:pointer;font:inherit;color:inherit;padding:0">Sign Out</button></form></div>
                 </div>
             </header>
 

@@ -51,8 +51,20 @@ try {
 // Unwrap view-once wrappers so the inner media/text content is reachable
 function unwrapContent(msg) {
     let m = msg;
-    while (m && (m.viewOnceMessageV2Extension || m.viewOnceMessageV2 || m.viewOnceMessage)) {
-        m = (m.viewOnceMessageV2Extension || m.viewOnceMessageV2 || m.viewOnceMessage).message;
+    // Full envelope chain (audit M11): ephemeral/view-once/document-with-
+    // caption/edited/group-mentioned wrappers all hide the real content.
+    // Without this, ephemeral statuses collide to signature 'txt:' (dedup
+    // suppresses reactions for the TTL) and anti-link/autoreply read empty
+    // text. Mirrors commands.js unwrapMessage; loops are bounded.
+    for (let i = 0; m && i < 8; i++) {
+        if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+        else if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+        else if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+        else if (m.viewOnceMessageV2Extension?.message) m = m.viewOnceMessageV2Extension.message;
+        else if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+        else if (m.editedMessage?.message) m = m.editedMessage.message;
+        else if (m.groupMentionedMessage?.message) m = m.groupMentionedMessage.message;
+        else break;
     }
     return m;
 }
@@ -146,21 +158,7 @@ async function recoverDeletedContent(sock, ownerJid, oldMsg, displayJid, isStatu
     // Unknown type — fall back to forwarding the raw original
     return await copyNForward(sock, ownerJid, oldMsg);
 }
-async function copyNForward(sock, jid, message, forceForward = false, options = {}) {
-    if (!message || !message.message) throw new Error('copyNForward: no message content');
-    const vtype = Object.keys(message.message)[0];
-    const isViewOnce = vtype === 'viewOnceMessage' || vtype === 'viewOnceMessageV2';
-    const content = isViewOnce ? message.message[vtype].message : message.message;
-    
-    return await sock.sendMessage(jid, { 
-        forward: {
-            key: message.key,
-            message: content,
-            forwardContent: true
-        },
-        ...options
-    });
-}
+const copyNForward = require('./lib/forward');
 
 // ── Console Forward ────────────────────────────────────────────────────────
 // Benign libsignal noise: "Bad MAC" = a decryption retry that WhatsApp
@@ -238,7 +236,9 @@ const handleOwnerCommand = makeHandleOwnerCommand({
     clearHistory,
     getCurrentSocket: () => currentSocket,
     getStatusStore: () => _statusMsgStore,
-    getProto: () => _proto
+    getProto: () => _proto,
+    copyNForward: require('./lib/forward'),
+    historyKey: require('./lib/groqAI').historyKey
 });
 
 // ── Presence ────────────────────────────────────────────────────────────────
@@ -389,31 +389,40 @@ async function start() {
         currentSocket = null;
     }
 
-    // Prune session bloat — app-state-sync keys + stale pre-keys/sessions accumulate forever
-    try {
-        const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-        const prekeyCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-        const files = fs.readdirSync(sessionDir);
-        let prekeyCount = 0;
-        for (const f of files) if (f.startsWith('pre-key-')) prekeyCount++;
-        for (const f of files) {
-            const isAppState = f.startsWith('app-state-sync-key-');
-            const isPreKey = f.startsWith('pre-key-');
-            const isSession = f.startsWith('session-');
-            if (!isAppState && !isPreKey && !isSession) continue;
-            try {
-                const fp = path.join(sessionDir, f);
-                const st = fs.statSync(fp);
-                if (isAppState && st.mtimeMs < cutoff) fs.rmSync(fp);
-                else if ((isPreKey || isSession) && (st.mtimeMs < prekeyCutoff || prekeyCount > 1000)) {
-                    // Keep most recent 1000 pre-keys, delete older sparse, but also age-based
-                    if (st.mtimeMs < prekeyCutoff || prekeyCount > 2000) {
-                        fs.rmSync(fp);
-                        if (isPreKey) prekeyCount--;
-                    }
+        // Prune session bloat — app-state-sync keys + stale pre-keys/sessions accumulate forever
+        try {
+            const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+            const prekeyCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+            const files = fs.readdirSync(sessionDir);
+            // (audit L17) Pre-key cap must be deterministic: sort by mtime and
+            // keep the newest 1000. The old nested condition deleted on
+            // count>2000 regardless of age and never on 1000<count<=2000, so
+            // the two thresholds contradicted each other and stale pre-keys
+            // piled up until decryption failures.
+            const prekeys = [];
+            for (const f of files) {
+                if (f.startsWith('pre-key-')) {
+                    try { prekeys.push({ f, mtime: fs.statSync(path.join(sessionDir, f)).mtimeMs }); } catch {}
                 }
-            } catch {}
-        }
+            }
+            if (prekeys.length > 1000) {
+                prekeys.sort((a, b) => a.mtime - b.mtime); // oldest first
+                for (let i = 0; i < prekeys.length - 1000; i++) {
+                    try { fs.rmSync(path.join(sessionDir, prekeys[i].f)); } catch {}
+                }
+            }
+            for (const f of files) {
+                const isAppState = f.startsWith('app-state-sync-key-');
+                const isPreKey = f.startsWith('pre-key-');
+                const isSession = f.startsWith('session-');
+                if (!isAppState && !isPreKey && !isSession) continue;
+                try {
+                    const fp = path.join(sessionDir, f);
+                    const st = fs.statSync(fp);
+                    if (isAppState && st.mtimeMs < cutoff) fs.rmSync(fp);
+                    else if (!isAppState && st.mtimeMs < prekeyCutoff) fs.rmSync(fp);
+                } catch {}
+            }
         // LID cache cleanup — prevent unbounded growth (also cleaned on set, but periodic full prune)
         if (_lidPnCache.size > 500) {
             const toDelete = _lidPnCache.size - 500;
@@ -637,7 +646,7 @@ async function start() {
             };
             messages = messages.filter(m => {
                 if (!m.key) return false;
-                const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').trim();
+                const text = (() => { const c = unwrapContent(m.message) || {}; return (c.conversation || c.extendedTextMessage?.text || '').trim(); })();
                 if (m.key.fromMe === true && text.startsWith('.') && text.length > 1 && ageOf(m) <= 120) return true;
                 // protocolMessage type 0 = revocation notice — the anti-delete
                 // payoff of an offline batch. recoverDeletedContent degrades
@@ -655,6 +664,9 @@ async function start() {
             // and replies in the rest of this batch are all dropped by a throw)
             try {
             if (!m.key || !m.message) continue;
+            // Unwrap ephemeral/view-once/edited envelopes ONCE here (audit M11)
+            // so every downstream text/caption read sees the real content.
+            m.message = unwrapContent(m.message);
             const jid = m.key.remoteJid;
             if (!jid) continue;
             
@@ -707,11 +719,17 @@ async function start() {
                     // A single delete is re-delivered several times by WhatsApp —
                     // the deleted original also keeps re-delivering and re-fills the
                     // store, so WITHOUT this, one delete spams N alerts.
+                    // (audit L16) The id is marked up front to suppress those
+                    // re-deliveries, but the mark is ROLLED BACK when nothing was
+                    // actually alerted (original not in the store yet) so a later
+                    // re-delivery — after the original syncs — can still alert once.
                     if (!_revokedIds.has(targetId)) {
                         _revokedIds.add(targetId);
                         if (_revokedIds.size > 300) _revokedIds.delete(_revokedIds.values().next().value);
                         const oldMsg = isStatus ? _statusMsgStore.get(targetId) : _msgStore.get(targetId);
-                        if (oldMsg && oldMsg.key && oldMsg.message) {
+                        if (!(oldMsg && oldMsg.key && oldMsg.message)) {
+                            _revokedIds.delete(targetId);
+                        } else {
                             // LID authors resolve to their real phone number via
                             // Baileys' LID mapping store (participantPn/senderPn
                             // are NOT populated on regular message keys)
@@ -890,8 +908,8 @@ async function start() {
                 const statusId = m.key.id;
                 const reactSig = (m.key.participant || '') + '|' + msgSignature(m);
                 if (_reactedStatus.has(reactSig) && Date.now() - _reactedStatus.get(reactSig) < STATUS_REACT_TTL) continue;
-                _reactedStatus.set(reactSig, Date.now());
-                if (_reactedStatus.size > 300) _reactedStatus.delete(_reactedStatus.keys().next().value);
+                // (audit L16) marked ONLY after the react is confirmed below —
+                // a failed send must not suppress the retry on re-delivery
                 const emojis = (userSettings.reactEmojis || '❤️,🖤,💚,🤍,💙,🩷,🩵').split(',').map(e => e.trim()).filter(Boolean);
                 const randomEmoji = emojis.length > 0 ? emojis[Math.floor(Math.random() * emojis.length)] : '❤️';
                 try { 
@@ -926,6 +944,9 @@ async function start() {
                     }, { 
                         statusJidList: [statusJid] 
                     }); 
+                    // React confirmed — only now claim the dedup slot
+                    _reactedStatus.set(reactSig, Date.now());
+                    if (_reactedStatus.size > 300) _reactedStatus.delete(_reactedStatus.keys().next().value);
                     console.log(`[Status] Reacted with ${randomEmoji} to ${statusJid.split('@')[0]}`);
                 } catch (e) {
                     console.error('[Status] React Error:', e?.stack || e);
@@ -1056,7 +1077,7 @@ async function start() {
                         try { await sock.sendPresenceUpdate('composing', jid); } catch (e) {}
 
                         const reply = await Promise.race([
-                            askGroq(jid, chatInput, m.pushName, { botName: (userSettings.botName || '').trim() || sock.user?.name || 'Alex', instructions: userSettings.botInstructions }),
+                            askGroq(jid, chatInput, m.pushName, { botName: (userSettings.botName || '').trim() || sock.user?.name || 'Alex', instructions: userSettings.botInstructions, participant: m.key.participant }),
                             new Promise((_, reject) => {
                                 groqTimeout = setTimeout(() => reject(new Error('Groq timeout')), 30000);
                             })
