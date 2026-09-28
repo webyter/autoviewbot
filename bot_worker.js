@@ -129,7 +129,8 @@ async function recoverDeletedContent(sock, ownerJid, oldMsg, displayJid, isStatu
         if (!buffer || !buffer.length) throw new Error('Media download failed');
         const msg = { [mediaType]: buffer };
         if (mediaType === 'image' || mediaType === 'video') {
-            msg.caption = (isStatus ? `📌 *Recovered status* from @${who}` : '') || content.imageMessage?.caption || content.videoMessage?.caption || '';
+            const origCaption = content.imageMessage?.caption || content.videoMessage?.caption || '';
+            msg.caption = (isStatus ? `📌 *Recovered status* from @${who}` : '') + (origCaption ? (isStatus ? '\n' : '') + origCaption : '');
             if (mentions) msg.mentions = mentions;
         } else if (mediaType === 'document') {
             msg.fileName = content.documentMessage?.fileName || 'recovered';
@@ -616,17 +617,30 @@ async function start() {
         }
         // History sync normally gets dropped. Baileys delivers messages sent
         // from the linked phone as fresh `append` events, though, including
-        // owner dot-commands. Let ONLY fresh fromMe commands through; this
-        // prevents stale commands replaying whenever the worker reconnects.
+        // owner dot-commands. But `append` is the whole OFFLINE batch, not
+        // just history sync — dropping all but fromMe commands blinded
+        // anti-delete exactly when it matters most (a delete that happens
+        // while we're down arrives here). Keep: fresh fromMe commands, recent
+        // messages (statuses/replies/reactions still work after reconnect),
+        // and revocation notices up to 6h old. Drop the rest of the history
+        // flood and cap the batch so a huge backlog can't be re-processed.
         if (type === 'prepend' || type === 'replace') return;
         if (type === 'append') {
             const nowSec = Math.floor(Date.now() / 1000);
-            messages = messages.filter(m => {
-                const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').trim();
+            const ageOf = (m) => {
                 const ts = typeof m.messageTimestamp?.toNumber === 'function' ? m.messageTimestamp.toNumber() : Number(m.messageTimestamp || 0);
-                return m.key?.fromMe === true && text.startsWith('.') && text.length > 1
-                    && ts > 0 && Math.abs(nowSec - ts) <= 120;
-            });
+                return ts > 0 ? Math.abs(nowSec - ts) : Infinity;
+            };
+            messages = messages.filter(m => {
+                if (!m.key) return false;
+                const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').trim();
+                if (m.key.fromMe === true && text.startsWith('.') && text.length > 1 && ageOf(m) <= 120) return true;
+                // protocolMessage type 0 = revocation notice — the anti-delete
+                // payoff of an offline batch. recoverDeletedContent degrades
+                // gracefully when the original is no longer in the store.
+                if (m.message?.protocolMessage && m.message.protocolMessage.type === 0) return ageOf(m) <= 6 * 60 * 60;
+                return ageOf(m) <= 15 * 60;
+            }).slice(-100);
             if (messages.length === 0) return;
         }
         // Single 3s head start per batch — the first reply waits, the rest
@@ -729,8 +743,10 @@ async function start() {
                                     mentions: [displayJid]
                                 };
                                 // Don't quote a status@broadcast message in a private chat
-                                if (!isStatus) alert.quoted = oldMsg;
-                                await sock.sendMessage(ownerJid, alert);
+                                // Baileys reads `quoted` from the OPTIONS (3rd arg),
+                                // not from the content — passing it inside `alert`
+                                // was silently dropped and alerts arrived unquoted
+                                await sock.sendMessage(ownerJid, alert, !isStatus && oldMsg ? { quoted: oldMsg } : undefined);
                             } catch (e) {
                                 console.error('[Anti-Delete] Alert error:', e?.stack || e);
                             }
@@ -810,16 +826,16 @@ async function start() {
                         const target = getTarget();
                         try {
                             const metaGA = await sock.groupMetadata(jid).catch(()=>null);
-                            if (!metaGA) return;
+                            if (!metaGA) continue; // this message failed — don't drop the rest of the batch
                             const senderGA = m.key.participant;
                             const botIdsGA = [sock.user?.id, sock.user?.lid, state.creds?.me?.id].filter(Boolean).map(j=>jidNormalizedUser(j));
-                            const isSenderAdminGA = metaGA?.participants.find(p=> jidNormalizedUser(p.id) === jidNormalizedUser(senderGA) || (isLidUser(senderGA) && p.lid && jidNormalizedUser(p.lid)===jidNormalizedUser(senderGA)) )?.admin;
+                            const isSenderAdminGA = metaGA?.participants.find(p=> jidNormalizedUser(p.id)===jidNormalizedUser(senderGA) || (isLidUser(senderGA) && p.lid && jidNormalizedUser(p.lid)===jidNormalizedUser(senderGA)) )?.admin;
                             const isBotAdminGA = metaGA?.participants.find(p=> botIdsGA.includes(jidNormalizedUser(p.id)) || (p.lid && botIdsGA.includes(jidNormalizedUser(p.lid))) )?.admin;
                             // Mention the target's REAL phone jid (prefer the group
                             // roster's pn entry) so @mentions show names, not digits
                             const targetPnGA = target ? ((metaGA.participants.find(p=> jidNormalizedUser(p.id)===target || (p.lid && jidNormalizedUser(p.lid)===target)) || {}).id || target) : target;
-                            if (!isSenderAdminGA) return;
-                            if (!isBotAdminGA) return;
+                            if (!isSenderAdminGA) continue;
+                            if (!isBotAdminGA) continue;
                             if (cmd==='promote' && target) { await sock.groupParticipantsUpdate(jid, [target], 'promote'); await sock.sendMessage(jid, {text: `✅ Promoted @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
                             else if (cmd==='demote' && target) { await sock.groupParticipantsUpdate(jid, [target], 'demote'); await sock.sendMessage(jid, {text: `✅ Demoted @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
                             else if ((cmd==='kick'||cmd==='remove') && target) { await sock.groupParticipantsUpdate(jid, [target], 'remove'); await sock.sendMessage(jid, {text: `✅ Removed @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }

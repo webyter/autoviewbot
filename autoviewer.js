@@ -59,7 +59,8 @@ function adminUsernameList() {
 function syncAdminUsers() {
     const list = adminUsernameList();
     if (!list.length) return;
-    const db = loadDB();
+    let db;
+    try { db = loadDB(); } catch (e) { return; } // fail closed: retry on next restart
     let changed = false;
     for (const u of list) {
         if (db[u] && !db[u].isAdmin) {
@@ -77,8 +78,13 @@ function loadDB() {
         const raw = fs.readFileSync(DB_PATH, 'utf8');
         return JSON.parse(raw);
     } catch (e) {
-        console.error('[Manager] DB Load Error:', e.message);
-        return {};
+        // FAIL CLOSED: a read/parse error (EMFILE, EACCES, truncated file) must
+        // never look like "no users" — that would hand an uninvited admin
+        // account to a stranger and let saveDB() wipe every real account.
+        // Throwing is caught by express (-> 500) and by dbTransaction (-> no
+        // save), both of which are safe outcomes.
+        console.error('[Manager] DB Load Error (failing closed):', e.message);
+        throw new Error('DB_UNAVAILABLE');
     }
 }
 
@@ -183,11 +189,11 @@ function startUserBot(username, clearSession = false) {
     // Reap any orphaned worker for this account not tracked in `instances`
     // (e.g. left behind by a manager crash where cleanup() never ran). A second
     // live connection to the same WA account causes MessageCounterError -> 428.
-    try { // safe: kill by pid from instances map, not shell pkill
-        const inst = instances.get(username);
-        if (inst?.child?.pid) try{ process.kill(inst.child.pid, 'SIGKILL'); }catch(e){}
-        // fallback: pkill with sanitized username only alphanumeric
-        if (isValidUsername(username)) require('child_process').execSync(`pkill -f "bot_worker.js ${username.replace(/[^a-zA-Z0-9_]/g,'')}"`, { stdio: 'ignore' });
+    // (Tracked stale instances were already SIGKILLed above.) Match the worker
+    // cmdline ANCHORED to the end of the username, so starting bot "bob" never
+    // SIGKILLs the live worker of "bob2".
+    try {
+        if (isValidUsername(username)) require('child_process').execSync(`pkill -f "bot_worker\\\\.js ${username}$"`, { stdio: 'ignore' });
     } catch (e) {}
 
     startingLock.add(username);
@@ -381,13 +387,21 @@ if (!effectiveSecret) {
     const secretFile = require('path').join(__dirname, 'session', '.session_secret');
     try {
         if (require('fs').existsSync(secretFile)) effectiveSecret = require('fs').readFileSync(secretFile, 'utf8').trim();
-        else { effectiveSecret = crypto.randomBytes(32).toString('hex'); require('fs').writeFileSync(secretFile, effectiveSecret); }
-    } catch(e){ effectiveSecret = crypto.randomBytes(32).toString('hex'); }
+        if (!effectiveSecret) {
+            effectiveSecret = crypto.randomBytes(32).toString('hex');
+            // Generate-and-persist works in EVERY environment (including
+            // production on Fly/Render with a mounted disk) — a crash-loop
+            // here is worse than a generated secret. Only a truly unwritable
+            // home falls back to a per-boot secret (with a warning).
+            try { require('fs').writeFileSync(secretFile, effectiveSecret); }
+            catch (writeErr) { effectiveSecret = crypto.randomBytes(32).toString('hex'); }
+        }
+    } catch (e) { effectiveSecret = crypto.randomBytes(32).toString('hex'); }
     if (process.env.NODE_ENV === 'production') {
-        console.error('[Manager] FATAL: SESSION_SECRET environment variable is required in production.');
-        process.exit(1);
+        console.warn('[Manager] ⚠️ SESSION_SECRET not set in production — using generated secret persisted to session/.session_secret (survives restarts on a persistent disk). Set SESSION_SECRET explicitly for multi-instance deployments.');
+    } else {
+        console.warn('[Manager] ⚠️ WARNING: Using generated session secret. Set SESSION_SECRET for production persistence.');
     }
-    console.warn('[Manager] ⚠️ WARNING: Using generated session secret. Set SESSION_SECRET for production persistence.');
 }
 app.use(session({
     secret: effectiveSecret,
@@ -430,7 +444,13 @@ function requireUser(req, res, next) {
         if (req.path.startsWith('/api')) return res.status(401).json({ status: 'error', message: 'Not authenticated.' });
         return res.redirect('/login');
     }
-    const db = loadDB();
+    let db;
+    try { db = loadDB(); }
+    catch (e) { // fail closed: don't log the user out on a transient disk error
+        console.error('[Manager] requireUser DB error:', e.message);
+        if (req.path.startsWith('/api')) return res.status(503).json({ status: 'error', message: 'Service temporarily unavailable.' });
+        return res.status(503).send('Service temporarily unavailable.');
+    }
     if (!db[req.session.user.username]) {
         req.session.destroy();
         if (req.path.startsWith('/api')) return res.status(401).json({ status: 'error', message: 'Not authenticated.' });
@@ -440,7 +460,17 @@ function requireUser(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-    const db = loadDB();
+    if (!req.session.user) {
+        if (req.path.startsWith('/api')) return res.status(401).json({ status: 'error', message: 'Not authenticated.' });
+        return res.redirect('/login');
+    }
+    let db;
+    try { db = loadDB(); }
+    catch (e) { // fail closed
+        console.error('[Manager] requireAdmin DB error:', e.message);
+        if (req.path.startsWith('/api')) return res.status(503).json({ status: 'error', message: 'Service temporarily unavailable.' });
+        return res.status(503).send('Service temporarily unavailable.');
+    }
     if (!db[req.session.user.username]?.isAdmin) {
         if (req.path.startsWith('/api')) return res.status(403).json({ status: 'error', message: 'Forbidden.' });
         return res.status(403).send('Forbidden');
@@ -575,8 +605,12 @@ function loginPage(error = '', req = null) {
 
 // Invite codes are only demanded once the first account exists — a fresh
 // install has a chicken-and-egg problem otherwise. The first signup is the
-// admin (via ADMIN_USERNAMES).
-function inviteRequired() { return Object.keys(loadDB()).length > 0; }
+// admin (via ADMIN_USERNAMES). On a DB error this fails closed (invite
+// required) rather than open.
+function inviteRequired() {
+    try { return Object.keys(loadDB()).length > 0; }
+    catch (e) { return true; }
+}
 
 // Registration is invite-only. Admin sets INVITE_CODE (comma separated for
 // multiple codes); with none set, registration is closed. Users with problems
@@ -1164,13 +1198,13 @@ function isValidUsername(u) {
 app.post('/register', registerLimiter, ah(async (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) return res.status(400).send(registerPage('Username and password are required.', req));
-    if (password.length < 6) return res.status(400).send(registerPage('Password must be at least 6 characters.', req));
+    if (typeof password !== 'string' || password.length < 6 || password.length > 100) return res.status(400).send(registerPage('Password must be 6-100 characters.', req));
 
     // Invite-only registration: valid codes are INVITE_CODE env entries plus
     // admin-managed codes stored in the invite store (single-use/expiry aware).
-    // With no codes at all, registration is closed entirely. The very first
-    // account (empty DB) bypasses the gate — someone has to bootstrap.
-    let dbInviteCode = null;
+    // This pre-check is UX only — the AUTHORITATIVE gate re-verifies and
+    // consumes the code inside the serialized transaction below, so concurrent
+    // registrations can't share a single-use code.
     if (inviteRequired()) {
         const envCodes = (process.env.INVITE_CODE || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
         if (!envCodes.length && !hasActiveInvites()) {
@@ -1182,18 +1216,9 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
             const b = Buffer.from(code);
             return a.length === b.length && crypto.timingSafeEqual(a, b);
         });
-        let codeOk = envOk;
-        if (!codeOk) {
-            // Timing-safe scan of the admin-managed store; only entries that
-            // are live (not revoked, under their use cap, unexpired) match.
-            const invites = loadInvites();
-            for (const [code, entry] of Object.entries(invites)) {
-                if (!isInviteLive(entry)) continue;
-                const b = Buffer.from(code);
-                if (a.length === b.length && crypto.timingSafeEqual(a, b)) { dbInviteCode = code; codeOk = true; break; }
-            }
+        if (!envOk && !findLiveInvite(invite)) {
+            return res.status(403).send(registerPage('Invalid invite code. Contact the admin to get one.', req));
         }
-        if (!codeOk) return res.status(403).send(registerPage('Invalid invite code. Contact the admin to get one.', req));
     }
 
     const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -1201,8 +1226,33 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
 
     const hashed = await bcrypt.hash(password, 10);
     let taken = false;
+    let inviteRejected = false;
     await dbTransaction((db) => {
         if (db[cleanUser]) { taken = true; return; }
+        const firstUser = Object.keys(db).length === 0;
+        // Atomic invite gate: authoritative check + consumption in this
+        // serialized transaction. Env codes bypass the store; admin-managed
+        // codes are re-verified live and their use-count incremented here, so
+        // N parallel registrations against a maxUses:1 code yield one account.
+        if (!firstUser) {
+            const invite = String(req.body.invite || '').trim().toUpperCase();
+            const envCodes = (process.env.INVITE_CODE || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+            const a = Buffer.from(invite);
+            const envOk = envCodes.some((code) => {
+                const b = Buffer.from(code);
+                return a.length === b.length && crypto.timingSafeEqual(a, b);
+            });
+            let matchedDbCode = null;
+            if (!envOk) matchedDbCode = findLiveInvite(invite);
+            if (!envOk && !matchedDbCode) { inviteRejected = true; return; }
+            if (matchedDbCode) {
+                const invites = loadInvites();
+                if (invites[matchedDbCode]) {
+                    invites[matchedDbCode].uses = (invites[matchedDbCode].uses || 0) + 1;
+                    saveInvites(invites);
+                }
+            }
+        }
         db[cleanUser] = { 
             password: hashed,
             autoreply: false,
@@ -1216,7 +1266,7 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
             anticall: false,
             antilink: false,
             groupAdmin: false,
-            isAdmin: adminUsernameList().includes(cleanUser) || Object.keys(db).length === 0,
+            isAdmin: adminUsernameList().includes(cleanUser) || firstUser,
             // Command-managed settings (dot commands, ported from GitHub version)
             allow: [],
             block: [],
@@ -1227,9 +1277,13 @@ app.post('/register', registerLimiter, ah(async (req, res) => {
             botInstructions: '',
             running: false
         };
-        consumeInvite(dbInviteCode);
     });
+    if (inviteRejected) return res.status(403).send(registerPage('Invalid invite code. Contact the admin to get one.', req));
     if (taken) return res.status(409).send(registerPage('Registration failed.', req));
+    // Fail-closed guard: if the transaction itself errored (disk trouble), no
+    // account was created — don't send the user to login as if it worked.
+    try { if (!loadDB()[cleanUser]) return res.status(500).send(registerPage('Registration failed due to a server error. Please try again.', req)); }
+    catch (e) { return res.status(503).send(registerPage('Service temporarily unavailable. Please try again.', req)); }
     res.redirect('/login');
 }));
 
@@ -1425,7 +1479,8 @@ function adminTarget(req) {
     const { username } = req.body || {};
     const clean = String(username || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
     if (!clean) return null;
-    const db = loadDB();
+    let db;
+    try { db = loadDB(); } catch (e) { return null; } // fail closed
     return db[clean] ? clean : null;
 }
 
@@ -1882,29 +1937,34 @@ function isInviteLive(entry) {
 function hasActiveInvites() {
     return Object.values(loadInvites()).some(isInviteLive);
 }
-function consumeInvite(code) {
-    if (!code) return;
-    try {
-        const invites = loadInvites();
-        if (invites[code]) {
-            invites[code].uses = (invites[code].uses || 0) + 1;
-            saveInvites(invites);
-        }
-    } catch (e) { console.error('[Invites] Consume failed:', e.message); }
-}
-function generateInviteCode() {
-    const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no I,L,O,0,1 — unambiguous when read aloud
-    const part = (n) => Array.from(crypto.randomBytes(n)).map(b => alphabet[b % alphabet.length]).join('');
-    const invites = loadInvites();
-    let code;
-    do { code = 'INV-' + part(5) + '-' + part(5); } while (invites[code]);
-    return code;
+// Timing-safe scan for a live admin-managed code matching `invite`.
+function findLiveInvite(invite, invites = loadInvites()) {
+    const a = Buffer.from(String(invite || ''));
+    for (const [code, entry] of Object.entries(invites)) {
+        if (!isInviteLive(entry)) continue;
+        const b = Buffer.from(code);
+        if (a.length === b.length && crypto.timingSafeEqual(a, b)) return code;
+    }
+    return null;
 }
 function inviteStatus(entry) {
     if (entry.revoked) return 'revoked';
     if (Number.isFinite(entry.expiresAt) && entry.expiresAt > 0 && Date.now() > entry.expiresAt) return 'expired';
     if (Number.isFinite(entry.maxUses) && entry.maxUses > 0 && (entry.uses || 0) >= entry.maxUses) return 'exhausted';
     return 'active';
+}
+
+// Serialized on the same queue as user-DB writes, so invite mutations can
+// never interleave with the register handler's atomic consume.
+function inviteTransaction(fn) {
+    dbQueue = dbQueue.then(async () => {
+        const invites = loadInvites();
+        await fn(invites);
+        saveInvites(invites);
+    }).catch(e => {
+        console.error('[Invites] Transaction Error:', e.message);
+    });
+    return dbQueue;
 }
 
 app.get('/api/admin/invites', requireUser, requireAdmin, (req, res) => {
@@ -1920,38 +1980,61 @@ app.get('/api/admin/invites', requireUser, requireAdmin, (req, res) => {
 app.post('/api/admin/invites/create', requireUser, requireAdmin, (req, res) => {
     const maxUses = parseInt((req.body || {}).maxUses, 10);
     const days = parseInt((req.body || {}).expiresInDays, 10);
-    const invites = loadInvites();
-    if (Object.keys(invites).length >= 200) return res.status(400).json({ status: 'error', message: 'Too many invite codes. Delete some first.' });
-    const code = generateInviteCode();
-    invites[code] = {
-        createdAt: Date.now(),
-        createdBy: req.session.user.username,
-        uses: 0,
-        maxUses: (Number.isFinite(maxUses) && maxUses > 0) ? Math.min(maxUses, 999) : null,
-        expiresAt: (Number.isFinite(days) && days > 0) ? Date.now() + days * 24 * 60 * 60 * 1000 : null,
-        revoked: false
-    };
-    saveInvites(invites);
-    console.log(`[Invites] Created ${code} by ${req.session.user.username}`);
-    res.json({ status: 'ok', code, invite: invites[code] });
+    let created = null;
+    let createdEntry = null;
+    let error = null;
+    inviteTransaction((invites) => {
+        if (Object.keys(invites).length >= 200) { error = 'Too many invite codes. Delete some first.'; return; }
+        const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no I,L,O,0,1 — unambiguous when read aloud
+        const part = (n) => Array.from(crypto.randomBytes(n)).map(b => alphabet[b % alphabet.length]).join('');
+        let code;
+        do { code = 'INV-' + part(5) + '-' + part(5); } while (invites[code]);
+        invites[code] = {
+            createdAt: Date.now(),
+            createdBy: req.session.user.username,
+            uses: 0,
+            maxUses: (Number.isFinite(maxUses) && maxUses > 0) ? Math.min(maxUses, 999) : null,
+            expiresAt: (Number.isFinite(days) && days > 0) ? Date.now() + days * 24 * 60 * 60 * 1000 : null,
+            revoked: false
+        };
+        created = code;
+        createdEntry = invites[code];
+    });
+    // The queue is async: respond only after this transaction has drained
+    dbQueue.then(() => {
+        if (error) return res.status(400).json({ status: 'error', message: error });
+        if (!created) return res.status(503).json({ status: 'error', message: 'Invite store temporarily unavailable.' });
+        console.log(`[Invites] Created ${created} by ${req.session.user.username}`);
+        res.json({ status: 'ok', code: created, invite: createdEntry });
+    });
 });
 app.post('/api/admin/invites/revoke', requireUser, requireAdmin, (req, res) => {
     const code = String((req.body || {}).code || '').trim().toUpperCase();
-    const invites = loadInvites();
-    if (!invites[code]) return res.status(404).json({ status: 'error', message: 'Unknown invite code.' });
-    invites[code].revoked = true;
-    saveInvites(invites);
-    console.log(`[Invites] Revoked ${code} by ${req.session.user.username}`);
-    res.json({ status: 'ok' });
+    let found = false;
+    inviteTransaction((invites) => {
+        if (!invites[code]) return;
+        invites[code].revoked = true;
+        found = true;
+    });
+    dbQueue.then(() => {
+        if (!found) return res.status(404).json({ status: 'error', message: 'Unknown invite code.' });
+        console.log(`[Invites] Revoked ${code} by ${req.session.user.username}`);
+        res.json({ status: 'ok' });
+    });
 });
 app.post('/api/admin/invites/delete', requireUser, requireAdmin, (req, res) => {
     const code = String((req.body || {}).code || '').trim().toUpperCase();
-    const invites = loadInvites();
-    if (!invites[code]) return res.status(404).json({ status: 'error', message: 'Unknown invite code.' });
-    delete invites[code];
-    saveInvites(invites);
-    console.log(`[Invites] Deleted ${code} by ${req.session.user.username}`);
-    res.json({ status: 'ok' });
+    let found = false;
+    inviteTransaction((invites) => {
+        if (!invites[code]) return;
+        delete invites[code];
+        found = true;
+    });
+    dbQueue.then(() => {
+        if (!found) return res.status(404).json({ status: 'error', message: 'Unknown invite code.' });
+        console.log(`[Invites] Deleted ${code} by ${req.session.user.username}`);
+        res.json({ status: 'ok' });
+    });
 });
 
 app.get('/api/status', apiLimiter, requireUser, (req, res) => {
@@ -2076,8 +2159,10 @@ const publicUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '
     // Reap orphaned worker processes left by a force-killed previous manager.
     // A fresh boot has an empty instances map, so without this it would fork a
     // SECOND worker for an account whose orphan is still connected, causing
-    // MessageCounterError ("Key used already") and 428 disconnects.
-    try { for(const [u,inst] of instances) try{ if(inst.child?.pid) process.kill(inst.child.pid,'SIGKILL'); }catch(e){} }
+    // MessageCounterError ("Key used already") and 428 disconnects. Sweep ALL
+    // bot_worker processes once, before any fork — the instances map is always
+    // empty here, so iterating it (the old approach) was a no-op.
+    try { require('child_process').execSync('pkill -f "bot_worker\\.js"', { stdio: 'ignore' }); }
     catch (e) { /* no workers / pkill unavailable */ }
 
     const db = loadDB();

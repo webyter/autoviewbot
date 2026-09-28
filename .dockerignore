@@ -3,6 +3,9 @@ node_modules
 .gitignore
 *.md
 config.env
+.env
+*.env
+server-config.json
 logs
 session
 node_modules
