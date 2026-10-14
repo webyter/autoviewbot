@@ -1926,30 +1926,46 @@ app.listen(port, () => {
         console.warn('[Manager] ⚠️ Warning: GROQ_API_KEY is not set. Auto-Reply will not function.');
     }
 
-    // Keep-alive: prevents Render free tier from sleeping (free tier sleeps
-    // after 15 min without inbound traffic; we self-ping /health every 10).
-const publicUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
+    // Keep-alive: self-ping this service when PUBLIC_URL is configured. On
+    // Fly.io, also ping the CODM Render service from this independently running
+    // app so the Render Free instance gets traffic before its idle-sleep window.
+    const publicUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
+    const wakekeepUrl = process.env.WAKEKEEP_URL ||
+        (process.env.FLY_APP_NAME === 'autoviewbot' ? 'https://codm-lat2.onrender.com/health' : '');
+    const pingUrl = (target, label) => {
+        try {
+            const req = (target.startsWith('http://') ? require('http') : https).get(target, { family: 4, timeout: 8000 }, (res) => {
+                if (res.statusCode !== 200) console.warn(`[${label}] Ping returned ${res.statusCode}`);
+                else console.log(`[${label}] Ping ok (${res.statusCode})`);
+                res.resume();
+            });
+            req.on('timeout', () => req.destroy(new Error('timeout')));
+            req.on('error', (e) => console.warn(`[${label}] Ping failed:`, e.message));
+        } catch (e) {
+            console.warn(`[${label}] Ping failed:`, e.message);
+        }
+    };
+    const pingSelf = () => {
+        if (publicUrl) pingUrl(publicUrl.replace(/\\/+$/, '') + '/health', 'KeepAlive');
+    };
+    const pingWakekeep = () => {
+        if (wakekeepUrl) pingUrl(wakekeepUrl, 'Wakekeep');
+    };
     if (publicUrl) {
-        console.log(`[Manager] Keep-alive enabled, pinging ${publicUrl} every 10 min`);
-        const pingSelf = () => {
-            try {
-                const url = publicUrl.replace(/\/+$/, '') + '/health';
-                const req = (url.startsWith('http://') ? require('http') : https).get(url, { family: 4, timeout: 8000 }, (res) => {
-                    if (res.statusCode !== 200) console.warn('[KeepAlive] Ping returned', res.statusCode);
-                    else console.log(`[KeepAlive] Ping ok (${res.statusCode})`);
-                    res.resume();
-                });
-                req.on('timeout', () => req.destroy(new Error('timeout')));
-                req.on('error', (e) => console.warn('[KeepAlive] Ping failed:', e.message));
-            } catch (e) {
-                console.warn('[KeepAlive] Ping failed:', e.message);
-            }
-        };
-        pingSelf(); // cover the sleep window right after boot
-        keepAliveTimer = setInterval(() => { checkMemoryWarn(); pingSelf(); }, 10 * 60 * 1000);
+        console.log(`[Manager] Self keep-alive enabled, pinging ${publicUrl}/health every 10 min`);
+        pingSelf();
     } else {
-        console.log('[Manager] No PUBLIC_URL set — keep-alive disabled. Set PUBLIC_URL in env to prevent Render sleep.');
+        console.log('[Manager] No PUBLIC_URL set — self keep-alive disabled.');
     }
+    if (wakekeepUrl) {
+        console.log(`[Manager] External wakekeep enabled, pinging ${wakekeepUrl} every 10 min`);
+        pingWakekeep();
+    }
+    keepAliveTimer = setInterval(() => {
+        checkMemoryWarn();
+        pingSelf();
+        pingWakekeep();
+    }, 10 * 60 * 1000);
 
     // Reap orphaned worker processes left by a force-killed previous manager.
     // A fresh boot has an empty instances map, so without this it would fork a
