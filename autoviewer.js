@@ -24,6 +24,11 @@ app.set('trust proxy', 1);
 const loginLimiter = rateLimit({ windowMs: 15*60*1000, max: 20, message: 'Too many login attempts, try later', standardHeaders: true, legacyHeaders: false });
 const registerLimiter = rateLimit({ windowMs: 60*60*1000, max: 10, message: 'Too many registrations, try later', standardHeaders: true, legacyHeaders: false });
 const apiLimiter = rateLimit({ windowMs: 60*1000, max: 60, standardHeaders: true, legacyHeaders: false });
+// The dashboard and the admin panel poll status every 4s (15/min per open tab),
+// so the 60/min limiter silently 429'd real users with a couple of tabs open
+// (or two users behind one NAT) and froze the dashboard. Polling gets its own,
+// higher ceiling.
+const statusLimiter = rateLimit({ windowMs: 60*1000, max: 300, standardHeaders: true, legacyHeaders: false });
 const port = process.env.PORT || 3000;
 
 // Never cache protected pages/APIs — browsers heuristically cache HTML and
@@ -42,6 +47,20 @@ const MAX_INSTANCES_FILE = path.join(__dirname, 'server-config.json');
 // Includes both schema dialects: 'chatai'/'antidelete' arrive from the
 // command engine and are mapped in UPDATE_SETTINGS below.
 const WORKER_EDITABLE_KEYS = ['autoreply', 'chatai', 'antideleteMsg', 'antidelete', 'antideleteStatus', 'antiTagStatus', 'autostatus', 'statusReact', 'groupAdmin', 'reactEmojis', 'antilink', 'allow', 'block', 'persona', 'admins', 'mode'];
+
+// Settings keys pushed TO a worker (manager -> worker SETTINGS messages).
+// A strict whitelist, not the raw row: the user record also holds the bcrypt
+// password hash and bookkeeping fields the worker never reads — the worker's
+// own SETTINGS_KEYS list is the consumer side of this list.
+const WORKER_SETTINGS_KEYS = ['autoreply', 'autostatus', 'statusReact', 'reactEmojis', 'antideleteMsg', 'antideleteStatus', 'antiTagStatus', 'presence', 'mode', 'anticall', 'botName', 'botInstructions', 'antilink', 'groupAdmin', 'allow', 'block', 'persona', 'admins'];
+function workerSettingsPayload(row) {
+    const out = {};
+    if (!row) return out;
+    for (const k of WORKER_SETTINGS_KEYS) {
+        if (row[k] !== undefined) out[k] = row[k];
+    }
+    return out;
+}
 function loadMaxInstances() {
     const env = Math.min(parseInt(process.env.MAX_INSTANCES || '5') || 5, 50);
     try {
@@ -83,8 +102,12 @@ function clearStartupWatchdog(username) {
     }
 }
 
-function startUserBot(username, clearSession = false) {
-    if (startingLock.has(username)) {
+function startUserBot(username, clearSession = false, force = false) {
+    // `force` is used by the restart routes. The lock is held for the whole
+    // lifetime of a live worker (see the exit handler), so without it a
+    // restart of a RUNNING bot answered 409 "already starting" and the
+    // dashboard's Restart button never did anything.
+    if (!force && startingLock.has(username)) {
         console.log(`[Manager] Bot already starting for ${username}`);
         return 'busy';
     }
@@ -200,14 +223,23 @@ function startUserBot(username, clearSession = false) {
 
         child.on('exit', (code, signal) => {
             console.log(`[Manager] Worker for ${username} exited (pid ${child.pid}, code ${code}, signal ${signal}). Active: ${instances.size - (instances.get(username)?.child === child ? 1 : 0)}/${MAX_INSTANCES}`);
-            // (audit L9) the starting lock spans the worker's lifetime — clear
-            // it here so the next start attempt is never locked out
-            startingLock.delete(username);
             const isCurrent = instances.get(username)?.child === child;
             if (isCurrent) {
+                // (audit L9) the starting lock spans the worker's lifetime —
+                // only the CURRENT worker's exit may release it. A forced
+                // restart kills the old child and forks a new one, and the
+                // stale exit used to clear the new worker's lock, letting a
+                // second spawn double-link the account (428 / MessageCounter).
+                startingLock.delete(username);
                 instances.delete(username);
                 clearStartupWatchdog(username);
-                const db = loadDB();
+                let db;
+                try { db = loadDB(); } catch (e) {
+                    // A transient DB read error must never throw out of this
+                    // listener: uncaughtException tears down every user's bot.
+                    console.error(`[Manager] DB unreadable when ${username}'s worker exited:`, e.message);
+                    return;
+                }
                 if (db[username]?.running) {
                     clearPendingRestart(username);
                     // Track consecutive crashes: only clear the session if the worker
@@ -263,8 +295,11 @@ function startUserBot(username, clearSession = false) {
                     }, 3000);
                     pendingRestarts.set(username, tid);
                 }
-            } else {
-                // No restart coming — a cached QR for a dead worker is stale
+            } else if (!instances.has(username)) {
+                // No restart coming — a cached QR for a dead worker is stale,
+                // and with no replacement worker the lock must go too (a stop
+                // can remove the instance before its exit event fires).
+                startingLock.delete(username);
                 lastQrCache.delete(username);
             }
         });
@@ -301,7 +336,13 @@ function startUserBot(username, clearSession = false) {
                 // child's exit event releases it asynchronously, so clear it
                 // here before the immediate restart
                 startingLock.delete(username);
-                const db = loadDB();
+                let db;
+                try { db = loadDB(); } catch (e) {
+                    // Same fail-soft rule as the exit handler: a disk hiccup
+                    // here must not escalate into a process-wide crash.
+                    console.error(`[Manager] DB unreadable during watchdog restart of ${username}:`, e.message);
+                    return;
+                }
                 if (db[username]?.running) {
                     // Do NOT clear the session — the worker may just be slow to
                     // connect (network/WA version fetch). Session is only cleared
@@ -353,7 +394,10 @@ if (!effectiveSecret) {
 // restarts on a persistent disk and expired ones get swept.
 const { FileSessionStore } = require('./lib/session-store');
 const sessionStore = new FileSessionStore({
-    dir: require('path').join(__dirname, 'session', 'sessions'),
+    // Honor SESSION_DIR like lib/db.js and bot_worker.js do — a hard-coded
+    // __dirname/session put web sessions outside a mounted volume and outside
+    // the directory the smoke test isolates.
+    dir: require('path').join(SESSION_BASE, 'sessions'),
     ttl: 24 * 60 * 60 * 1000
 });
 app.use(session({
@@ -983,7 +1027,12 @@ app.post('/login', loginLimiter, ah(async (req, res) => {    const { username, p
     const db = loadDB();
     // Always run one bcrypt compare — unknown users must be indistinguishable
     // from wrong-password users by response timing (user enumeration).
-    const ok = !!db[cleanUser] && await bcrypt.compare(password, db[cleanUser].password || DUMMY_HASH);
+    // Short-circuiting on `!!db[cleanUser]` first skipped the compare entirely
+    // for unknown usernames (~0ms vs ~100ms for a real one), so the DUMMY_HASH
+    // path below never even executed. Compute the hash target first, compare
+    // always.
+    const pwHash = db[cleanUser]?.password || DUMMY_HASH;
+    const ok = !!db[cleanUser] && await bcrypt.compare(password, pwHash);
     if (ok) {
         req.session.regenerate(() => {
             // (audit L8) bind the session to this account INSTANCE — a
@@ -1110,7 +1159,7 @@ app.post('/settings/toggle', requireUser, ah(async (req, res) => {
         if (!dbCheck[username]?.groupAdmin) return res.status(400).json({ status: 'error', message: 'Enable Group Admin Tools first' });
     }
     let enabled;
-    await dbTransaction((db) => {
+    const saved = await dbTransaction((db) => {
         if (!db[username]) return;
         if (feature === 'mode') {
             // mode is 'self'|'public', not boolean
@@ -1127,10 +1176,11 @@ app.post('/settings/toggle', requireUser, ah(async (req, res) => {
         const inst = instances.get(username);
         if (inst && inst.child) {
             // A dead/reconnecting child must not abort the DB save
-            try { inst.child.send({ type: 'SETTINGS', settings: db[username] }); }
+            try { inst.child.send({ type: 'SETTINGS', settings: workerSettingsPayload(db[username]) }); }
             catch (e) { console.warn(`[Manager] Worker unreachable for ${username} (will pick up settings on next load): ${e.message}`); }
         }
     });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not save the setting. Try again.' });
     res.json({ status: 'ok', enabled });
 }));
 
@@ -1142,15 +1192,16 @@ app.post('/settings/update-emojis', requireUser, ah(async (req, res) => {
     const cleaned = emojis.split(',').map(s => s.replace(/[^\p{So}\p{Sk}\uFE0F\u200D]/gu, '').trim()).filter(Boolean).join(',');
     if (!cleaned) return res.status(400).json({ status: 'error', message: 'No valid emojis found.' });
     const username = req.session.user.username;
-    await dbTransaction((db) => {
+    const saved = await dbTransaction((db) => {
         if (!db[username]) return;
         db[username].reactEmojis = cleaned;
         const inst = instances.get(username);
         if (inst && inst.child) {
-            try { inst.child.send({ type: 'SETTINGS', settings: db[username] }); }
+            try { inst.child.send({ type: 'SETTINGS', settings: workerSettingsPayload(db[username]) }); }
             catch (e) { console.warn(`[Manager] Worker unreachable for ${username}: ${e.message}`); }
         }
     });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not save the emojis. Try again.' });
     res.json({ status: 'ok' });
 }));
 
@@ -1158,7 +1209,7 @@ app.post('/settings/bot-profile', requireUser, ah(async (req, res) => {
     const { botName, botInstructions } = req.body || {};
     const instr = String(botInstructions ?? '').slice(0, 1000);
     const username = req.session.user.username;
-    await dbTransaction((db) => {
+    const saved = await dbTransaction((db) => {
         if (!db[username]) return;
         // botName is only touched when explicitly provided — saving
         // instructions must not wipe an existing name
@@ -1166,10 +1217,11 @@ app.post('/settings/bot-profile', requireUser, ah(async (req, res) => {
         db[username].botInstructions = instr;
         const inst = instances.get(username);
         if (inst && inst.child) {
-            try { inst.child.send({ type: 'SETTINGS', settings: db[username] }); }
+            try { inst.child.send({ type: 'SETTINGS', settings: workerSettingsPayload(db[username]) }); }
             catch (e) { console.warn(`[Manager] Worker unreachable for ${username}: ${e.message}`); }
         }
     });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not save the instructions. Try again.' });
     res.json({ status: 'ok' });
 }));
 
@@ -1185,15 +1237,16 @@ app.post('/settings/update-lists', requireUser, ah(async (req, res) => {
         cleaned = value.split(/[\n,;\s.]+/).map(s => s.replace(/[^0-9]/g, '')).filter(v => v.length >= 8 && v.length <= 15);
         if (cleaned.length > 200) return res.status(400).json({ status: 'error', message: 'List too long (max 200 numbers).' });
     }
-    await dbTransaction((db) => {
+    const saved = await dbTransaction((db) => {
         if (!db[username]) return;
         db[username][key] = cleaned;
         const inst = instances.get(username);
         if (inst && inst.child) {
-            try { inst.child.send({ type: 'SETTINGS', settings: db[username] }); }
+            try { inst.child.send({ type: 'SETTINGS', settings: workerSettingsPayload(db[username]) }); }
             catch (e) { console.warn(`[Manager] Worker unreachable for ${username}: ${e.message}`); }
         }
     });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not save the list. Try again.' });
     res.json({ status: 'ok' });
 }));
 app.post('/settings/presence', requireUser, ah(async (req, res) => {
@@ -1202,15 +1255,16 @@ app.post('/settings/presence', requireUser, ah(async (req, res) => {
         return res.status(400).json({ status: 'error', message: 'Invalid presence value.' });
     }
     const username = req.session.user.username;
-    await dbTransaction((db) => {
+    const saved = await dbTransaction((db) => {
         if (!db[username]) return;
         db[username].presence = presence;
         const inst = instances.get(username);
         if (inst && inst.child) {
-            try { inst.child.send({ type: 'SETTINGS', settings: db[username] }); }
+            try { inst.child.send({ type: 'SETTINGS', settings: workerSettingsPayload(db[username]) }); }
             catch (e) { console.warn(`[Manager] Worker unreachable for ${username}: ${e.message}`); }
         }
     });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not save the presence. Try again.' });
     res.json({ status: 'ok' });
 }));
 
@@ -1224,7 +1278,7 @@ app.post('/bot/start', requireUser, ah(async (req, res) => {
     if (started === 'busy') return res.status(409).json({ status: 'error', message: 'Bot is already starting.' });
     if (started === 'capacity') return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
     await dbTransaction((db) => {
-        if (instances.has(username)) db[username].running = true;
+        if (instances.has(username) && db[username]) db[username].running = true;
     });
     res.json({ status: 'ok' });
 }));
@@ -1260,10 +1314,14 @@ app.post('/bot/restart', requireUser, ah(async (req, res) => {
     if (instances.size >= MAX_INSTANCES && !instances.has(username)) {
         return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
     }
-    const started = startUserBot(username, false);
+    const started = startUserBot(username, false, true);
     if (started === 'busy') return res.status(409).json({ status: 'error', message: 'Bot is already starting.' });
     if (started === 'capacity') return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
-    await dbTransaction((db) => { db[username].running = true; });
+    const saved = await dbTransaction((db) => {
+        if (!db[username]) return;
+        db[username].running = true;
+    });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not update the account. Try again.' });
     res.json({ status: 'ok' });
 }));
 
@@ -1273,10 +1331,14 @@ app.post('/api/refresh-qr', requireUser, ah(async (req, res) => {
         return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
     }
     clearPendingRestart(username);
-    const started = startUserBot(username, true);
+    const started = startUserBot(username, true, true);
     if (started === 'busy') return res.status(409).json({ status: 'error', message: 'Bot is already starting.' });
     if (started === 'capacity') return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
-    await dbTransaction((db) => { db[username].running = true; });
+    const saved = await dbTransaction((db) => {
+        if (!db[username]) return;
+        db[username].running = true;
+    });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not update the account. Try again.' });
     res.json({ status: 'ok' });
 }));
 
@@ -1336,7 +1398,7 @@ app.post('/api/admin/bot/start', requireUser, requireAdmin, ah(async (req, res) 
     const started = startUserBot(username, false);
     if (started === 'busy') return res.status(409).json({ status: 'error', message: 'Bot is already starting.' });
     if (started === 'capacity') return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
-    await dbTransaction((db) => { if (instances.has(username)) db[username].running = true; });
+    await dbTransaction((db) => { if (instances.has(username) && db[username]) db[username].running = true; });
     res.json({ status: 'ok' });
 }));
 
@@ -1368,10 +1430,14 @@ app.post('/api/admin/bot/restart', requireUser, requireAdmin, ah(async (req, res
     if (instances.size >= MAX_INSTANCES && !instances.has(username)) {
         return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
     }
-    const started = startUserBot(username, false);
+    const started = startUserBot(username, false, true);
     if (started === 'busy') return res.status(409).json({ status: 'error', message: 'Bot is already starting.' });
     if (started === 'capacity') return res.status(503).json({ status: 'error', message: `Max capacity (${MAX_INSTANCES} bots) reached.` });
-    await dbTransaction((db) => { db[username].running = true; });
+    const saved = await dbTransaction((db) => {
+        if (!db[username]) return;
+        db[username].running = true;
+    });
+    if (!saved) return res.status(500).json({ status: 'error', message: 'Could not update the account. Try again.' });
     res.json({ status: 'ok' });
 }));
 app.post('/api/admin/user/delete', requireUser, requireAdmin, ah(async (req, res) => {
@@ -1664,7 +1730,15 @@ app.get('/admin', requireUser, requireAdmin, (req, res) => {
                 try{const d=await getJSON('/api/admin/users');$('err').textContent='';apply(d)}
                 catch(e){$('err').textContent='Users failed to load: '+e.message}
             }
-            $('q').addEventListener('input',()=>document.querySelectorAll('.card').forEach(c=>set(c,{username:c.dataset.user})));
+            // Filtering is a visibility toggle only. Re-rendering each card from
+            // {username} alone blanked its status pill, presence, feature icons
+            // and error text until the next 4s poll.
+            $('q').addEventListener('input',()=>{
+                const q=($('q').value||'').toLowerCase();
+                document.querySelectorAll('.card').forEach(c=>{
+                    c.style.display=(!q||c.dataset.user.indexOf(q)>=0)?'':'none';
+                });
+            });
             $('cards').addEventListener('click',async ev=>{
                 const b=ev.target.closest('button[data-act]');if(!b)return;
                 const act=b.dataset.act,u=b.closest('.card').dataset.user;
@@ -1832,7 +1906,7 @@ app.post('/api/admin/invites/delete', requireUser, requireAdmin, (req, res) => {
     });
 });
 
-app.get('/api/status', apiLimiter, requireUser, (req, res) => {
+app.get('/api/status', statusLimiter, requireUser, (req, res) => {
     const username = req.session.user.username;
     const cached = lastQrCache.get(username);
     const inst = instances.get(username) || { status: 'stopped', qr: null, qrDataUrl: null, ppUrl: null, errorMsg: null };
@@ -1926,12 +2000,9 @@ app.listen(port, () => {
         console.warn('[Manager] ⚠️ Warning: GROQ_API_KEY is not set. Auto-Reply will not function.');
     }
 
-    // Keep-alive: self-ping this service when PUBLIC_URL is configured. On
-    // Fly.io, also ping the CODM Render service from this independently running
-    // app so the Render Free instance gets traffic before its idle-sleep window.
+    // Keep-alive: self-ping this service when PUBLIC_URL is configured, so the
+    // host's idle-sleep window never closes on a platform that spins down.
     const publicUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
-    const wakekeepUrl = process.env.WAKEKEEP_URL ||
-        (process.env.FLY_APP_NAME === 'autoviewbot' ? 'https://codm-lat2.onrender.com/health' : '');
     const pingUrl = (target, label) => {
         try {
             const req = (target.startsWith('http://') ? require('http') : https).get(target, { family: 4, timeout: 8000 }, (res) => {
@@ -1946,10 +2017,7 @@ app.listen(port, () => {
         }
     };
     const pingSelf = () => {
-        if (publicUrl) pingUrl(publicUrl.replace(/\\/+$/, '') + '/health', 'KeepAlive');
-    };
-    const pingWakekeep = () => {
-        if (wakekeepUrl) pingUrl(wakekeepUrl, 'Wakekeep');
+        if (publicUrl) pingUrl(publicUrl.replace(/\/+$/, '') + '/health', 'KeepAlive');
     };
     if (publicUrl) {
         console.log(`[Manager] Self keep-alive enabled, pinging ${publicUrl}/health every 10 min`);
@@ -1957,14 +2025,9 @@ app.listen(port, () => {
     } else {
         console.log('[Manager] No PUBLIC_URL set — self keep-alive disabled.');
     }
-    if (wakekeepUrl) {
-        console.log(`[Manager] External wakekeep enabled, pinging ${wakekeepUrl} every 10 min`);
-        pingWakekeep();
-    }
     keepAliveTimer = setInterval(() => {
         checkMemoryWarn();
         pingSelf();
-        pingWakekeep();
     }, 10 * 60 * 1000);
 
     // Reap orphaned worker processes left by a force-killed previous manager.

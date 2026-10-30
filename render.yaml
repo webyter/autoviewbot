@@ -16,7 +16,9 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: ADMIN_USERNAMES
-        value: moi
+        # Set your own admin username(s) here. A fixed value shipped in the
+        # blueprint handed platform admin to whoever registered that name.
+        sync: false
       - key: ADMIN_CONTACT
         value: 233531556024
       - key: INVITE_CODE

@@ -854,6 +854,7 @@ async function start() {
                             return null;
                         };
                         const target = getTarget();
+                        let handledGA = false;
                         try {
                             const metaGA = await sock.groupMetadata(jid).catch(()=>null);
                             if (!metaGA) continue; // this message failed — don't drop the rest of the batch
@@ -886,10 +887,16 @@ async function start() {
                                 else if (sub==='off') { userSettings.antilink=false; sendToParent({ type: 'UPDATE_SETTINGS', changes: { antilink: false } }); await sock.sendMessage(jid,{text:'🔗 Anti-Link OFF'});  }
                                 else await sock.sendMessage(jid,{text:'Usage: .antilink on/off (also dashboard toggle)'});
                             }
+                            handledGA = true;
                             } // end admin-gated group command chain
                         } catch(e){ console.error('[GroupAdmin] error', e.stack||e); }
-                        // do not fallthrough to autoreply for commands
-                        continue;
+                        // Only the admin-gated chain above consumes the command.
+                        // When the sender or the bot lacks group-admin rights the
+                        // message must fall through to the owner command engine
+                        // (4.5) — the old unconditional `continue` made .kick,
+                        // .tagall, .antilink ... dead for an owner who is not a
+                        // group admin himself.
+                        if (handledGA) continue;
                     }
                 }
             }
@@ -968,7 +975,10 @@ async function start() {
             }
 
             // 3b. Anti-Tag Status — detect statuses that tag groups.
-            if (jid === 'status@broadcast' && userSettings.antiTagStatus === true && userSettings.groupAdmin !== false) {
+            // Independent of groupAdmin: the dashboard presents it as its own
+            // toggle, and the old groupAdmin !== false condition made it dead
+            // unless Group Admin Tools was also switched on.
+            if (jid === 'status@broadcast' && userSettings.antiTagStatus === true) {
                 const ctxInfo = m.message.extendedTextMessage?.contextInfo || m.message.imageMessage?.contextInfo || m.message.videoMessage?.contextInfo || {};
                 const mentionedJid = ctxInfo.mentionedJid || [];
                 const groupMentions = ctxInfo.groupMentions || [];
