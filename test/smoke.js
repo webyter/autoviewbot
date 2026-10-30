@@ -169,6 +169,31 @@ async function main() {
             body: JSON.stringify({ feature: 'autoreply' })
         });
         check('bad CSRF rejected', r.status === 403);
+
+        // ── login with unknown user returns 401 ──
+        r = await request('GET', `${BASE}/login`);
+        const freshC = jar(r), freshTok = csrf(r.body);
+        r = await request('POST', `${BASE}/login`, {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': freshC },
+            body: `username=nonexistentuser&password=Passw0rd123&_csrf=${freshTok}`
+        });
+        check('unknown user login 401', r.status === 401, `status=${r.status}`);
+
+        // ── settings updates with valid CSRF ──
+        r = await request('POST', `${BASE}/settings/bot-profile`, {
+            headers: { 'Content-Type': 'application/json', 'Cookie': cookie2, 'X-CSRF-Token': tok2 },
+            body: JSON.stringify({ botName: 'AlexBot', botInstructions: 'Test instructions' })
+        });
+        check('bot-profile update ok', r.status === 200 && JSON.parse(r.body).status === 'ok');
+
+        r = await request('POST', `${BASE}/settings/update-lists`, {
+            headers: { 'Content-Type': 'application/json', 'Cookie': cookie2, 'X-CSRF-Token': tok2 },
+            body: JSON.stringify({ key: 'allow', value: '233201234567, 233501234567' })
+        });
+        check('update-lists allow ok', r.status === 200 && JSON.parse(r.body).status === 'ok');
+
+        r = await request('GET', `${BASE}/health`);
+        check('health endpoint returns ok', r.status === 200 && JSON.parse(r.body).status === 'ok');
     } finally {
         child.kill('SIGKILL');
         try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (_) {}

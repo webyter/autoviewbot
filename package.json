@@ -4,7 +4,8 @@
   "description": "AutoViewer \u2014 Multi-user WhatsApp automation platform with per-user settings, QR linking, auto-status, and ChatAI.",
   "main": "autoviewer.js",
   "scripts": {
-    "start": "node autoviewer.js"
+    "start": "node autoviewer.js",
+    "test": "node test/smoke.js"
   },
   "engines": {
     "node": ">=20.0.0"

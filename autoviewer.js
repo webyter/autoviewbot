@@ -59,6 +59,11 @@ function workerSettingsPayload(row) {
     for (const k of WORKER_SETTINGS_KEYS) {
         if (row[k] !== undefined) out[k] = row[k];
     }
+    // .persona and botInstructions are the same concept (KEYMAP maps persona
+    // → botInstructions when persisting). Keep the worker's persona field in
+    // sync so .settings display shows the right value after a settings
+    // round-trip or worker restart.
+    if (out.persona === undefined || !out.persona) out.persona = out.botInstructions || '';
     return out;
 }
 function loadMaxInstances() {
@@ -1020,7 +1025,8 @@ app.get('/login', (req, res) => {
 // Pre-computed hash so the login handler always runs one bcrypt compare —
 // unknown usernames must be indistinguishable from wrong passwords by timing.
 const DUMMY_HASH = bcrypt.hashSync('nova-timing-dummy-pw', 10);
-app.post('/login', loginLimiter, ah(async (req, res) => {    const { username, password } = req.body || {};
+app.post('/login', loginLimiter, ah(async (req, res) => {
+    const { username, password } = req.body || {};
     const cleanUser = (username || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
     if (!cleanUser || !isValidUsername(cleanUser) || typeof password !== 'string' || !password || password.length < 6 || password.length > 100) return res.status(401).send(loginPage('Invalid username or password.', req));
     
@@ -1032,7 +1038,11 @@ app.post('/login', loginLimiter, ah(async (req, res) => {    const { username, p
     // path below never even executed. Compute the hash target first, compare
     // always.
     const pwHash = db[cleanUser]?.password || DUMMY_HASH;
-    const ok = !!db[cleanUser] && await bcrypt.compare(password, pwHash);
+    // Always run the compare — short-circuiting on !!db[cleanUser] first
+    // would skip the ~100ms bcrypt work for unknown usernames, leaking
+    // whether an account exists via response timing.
+    const pwMatch = await bcrypt.compare(password, pwHash);
+    const ok = !!db[cleanUser] && pwMatch;
     if (ok) {
         req.session.regenerate(() => {
             // (audit L8) bind the session to this account INSTANCE — a
@@ -1231,9 +1241,9 @@ app.post('/settings/update-lists', requireUser, ah(async (req, res) => {
     if (!key || !EDITABLE_LISTS.has(key) || typeof value !== 'string') return res.status(400).json({ status: 'error', message: 'Invalid input.' });
     const username = req.session.user.username;
     let cleaned;
-    if (key === 'persona') {
-        cleaned = value.trim().slice(0, 2000);
-    } else {
+    // 'persona' is NOT in EDITABLE_LISTS (only 'allow','block','admins'),
+    // so this branch was unreachable dead code. Removed.
+    {
         cleaned = value.split(/[\n,;\s.]+/).map(s => s.replace(/[^0-9]/g, '')).filter(v => v.length >= 8 && v.length <= 15);
         if (cleaned.length > 200) return res.status(400).json({ status: 'error', message: 'List too long (max 200 numbers).' });
     }
@@ -1872,7 +1882,8 @@ app.post('/api/admin/invites/create', requireUser, requireAdmin, (req, res) => {
         console.log(`[Invites] Created ${created} by ${req.session.user.username}`);
         // Full invite link: PUBLIC_URL/RENDER_EXTERNAL_URL when set, otherwise
         // derive from the request (trust proxy is on, so this is the public host).
-        const base = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || (req.protocol + '://' + req.get('host'));
+        let base = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || (req.protocol + '://' + req.get('host'))).trim();
+        if (base && !/^https?:\/\//i.test(base)) base = 'https://' + base;
         const url = base.replace(/\/+$/, '') + '/register?code=' + encodeURIComponent(created);
         res.json({ status: 'ok', code: created, invite: createdEntry, url });
     });
@@ -2002,7 +2013,9 @@ app.listen(port, () => {
 
     // Keep-alive: self-ping this service when PUBLIC_URL is configured, so the
     // host's idle-sleep window never closes on a platform that spins down.
-    const publicUrl = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
+    let rawPublicUrl = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').trim();
+    if (rawPublicUrl && !/^https?:\/\//i.test(rawPublicUrl)) rawPublicUrl = 'https://' + rawPublicUrl;
+    const publicUrl = rawPublicUrl;
     const pingUrl = (target, label) => {
         try {
             const req = (target.startsWith('http://') ? require('http') : https).get(target, { family: 4, timeout: 8000 }, (res) => {

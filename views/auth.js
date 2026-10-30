@@ -112,6 +112,9 @@ function sPage(title, subtitle, icon, accent, fields, footer, error) {
     </body></html>`;
 }
 
+const ADMIN_CONTACT = (process.env.ADMIN_CONTACT || '233531556024').replace(/\D/g, '') || '233531556024';
+const contactFooter = `Having problems or want an account? Contact the admin on <a href="https://wa.me/${ADMIN_CONTACT}" target="_blank" rel="noopener" style="color:var(--accent)">WhatsApp</a>.`;
+
 function loginPage(error = '', req = null) {
     const csrf = req ? csrfToken(req) : '';
     return sPage('Sign In', 'Sign in to your account',
@@ -138,16 +141,12 @@ function inviteRequired() {
     catch (e) { return true; }
 }
 
-// Registration is invite-only. Admin sets INVITE_CODE (comma separated for
-// multiple codes); with none set, registration is closed. Users with problems
-// are pointed at the admin's WhatsApp.
-const ADMIN_CONTACT = process.env.ADMIN_CONTACT || '233531556024';
-const contactFooter = `Having problems or want an account? Contact the admin on <a href="https://wa.me/${ADMIN_CONTACT}" target="_blank" rel="noopener" style="color:var(--accent)">WhatsApp</a>.`;
-
 function registerPage(error = '', req = null) {
     const csrf = req ? csrfToken(req) : '';
-    // ?code=INV-... from an invite link pre-fills the field (sanitized).
-    const preInvite = (req && req.query && typeof req.query.code === 'string') ? req.query.code.slice(0, 64) : '';
+    // ?code=INV-... from an invite link (or submitted code on POST error) pre-fills the field (sanitized).
+    const rawCode = (req && req.body && typeof req.body.invite === 'string' && req.body.invite) ||
+                    (req && req.query && typeof req.query.code === 'string' && req.query.code) || '';
+    const preInvite = rawCode.slice(0, 64);
     return sPage('Create Account', 'Join the AutoViewer platform',
         '<svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" fill="#007aff"/></svg>',
         '#007aff',
