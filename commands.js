@@ -174,6 +174,59 @@ const fb = (s) => String(s).replace(/[A-Za-z0-9]/g, (c) => {
     return c;
 });
 const FOOT = ' _AutoViewer_';
+
+// ── Fun command data (all local — no network, no keys) ─────────────────────
+const EIGHT_BALL = [
+    'It is certain.', 'Without a doubt.', 'You may rely on it.',
+    'Yes, definitely.', 'Signs point to yes.', 'Outlook good.',
+    'Most likely.', 'Ask again later.', 'Better not tell you now.',
+    'Cannot predict now.', "Don't count on it.", 'My reply is no.',
+    'My sources say no.', 'Very doubtful.', 'Concentrate and ask again.',
+];
+const JOKES = [
+    'Why do programmers prefer dark mode? Because light attracts bugs.',
+    'Debugging: being the detective in a crime movie where you are also the murderer.',
+    'There are 10 types of people: those who understand binary and those who do not.',
+    'My code works on my phone. I refuse to test it anywhere else.',
+    'Trotro mate logic: the car is full until he sees one more passenger.',
+    'Why did the developer go broke? He used up all his cache.',
+    "Your Wi-Fi relationship status: it's complicated.",
+    'I fixed the bug by adding a comment that says DO NOT TOUCH.',
+    'Bank app: your session has expired. You logged in three seconds ago.',
+    'Ghana forecast today: sunny, cloudy and raining — all before noon.',
+    'My phone battery lasts longer than my motivation on Mondays.',
+    'I put my phone in airplane mode but it refused to fly.',
+    'ACCRA traffic is the only place where moving two metres counts as progress.',
+    'I asked the barber to make me look sharp. Now I am afraid of scissors.',
+    'My wallet is like an onion — every time I open it, I cry.',
+    'ECG took the light, so I charged my phone with hope. It is at 4%.',
+    'I am on a seafood diet. I see food and I eat it.',
+    'The only exercise I did this month was running out of data.',
+    "Never trust an atom. They make up everything.",
+    'I would tell you a UDP joke, but you might not get it.',
+    'DSTV: 500 channels and nothing is on. Story of my life.',
+    'My bed and I are in a serious relationship. Mornings tear us apart.',
+];
+const QUOTES = [
+    'Fall seven times, stand up eight.',
+    'Slow progress is still progress.',
+    'Discipline is choosing between what you want now and what you want most.',
+    'Nobody is coming to save you. Good — you get to.',
+    'The best time to plant a tree was 20 years ago. The second best time is now.',
+    'Do something today that your future self will thank you for.',
+    'Small daily wins compound.',
+    'You do not have to be great to start, but you have to start to be great.',
+    'A river cuts through rock not because of its power, but its persistence.',
+    'Compare yourself to who you were yesterday, not to who someone else is today.',
+    'Hard seasons grow deep roots.',
+    'If you are tired of starting over, stop giving up.',
+    'Opportunities do not knock twice — but they do text. Reply.',
+    'Fear is a liar. The data says you have survived 100% of your worst days.',
+    'Make peace with your past so it does not spoil your present.',
+    'The person who moves a mountain begins by carrying away small stones.',
+    'You cannot go back and change the start, but you can start where you are and change the ending.',
+    'Stars cannot shine without darkness.',
+];
 const fmtMs = (ms) => ms == null ? '`—`' : '`' + ms + ' ms`';
 const onOff = (v) => v ? 'ON ✅' : 'OFF ❌';
 
@@ -216,6 +269,14 @@ _Mode + admin list always stay locked to your phone._
 ⠿ \`.mute/.unmute\` · \`.tagall\`
 _Listed admins run commands. Group
 actions need my admin rights._
+
+🎉 *${fb('Fun')}
+⠿ \`.flip\` — flip a coin
+⠿ \`.roll [2d20]\` — roll dice
+⠿ \`.pick a, b, c\` — pick one for me
+⠿ \`.8ball <question>\` — magic 8-ball
+⠿ \`.love @user\` — love meter
+⠿ \`.joke\` · \`.quote\` — a little joy
 
 📥 *${fb('Status')}*
 ⠿ \`.save\` — save a status
@@ -269,16 +330,26 @@ async function handleOwnerCommand(sock, body, m, jid) {
     const adminList = Array.isArray(userSettings.admins) ? userSettings.admins : [];
     const listedAdmin = !isOwner && adminList.some(n => numMatch(senderNum, n));
     // .mode public: anyone may run commands. But some commands must NEVER
-    // open up: .admin/.mode (owner-only, no exceptions) and anything that
-    // mutates PERSISTED settings (.allow/.block/.persona) — public mode must
-    // never let strangers poison the allow/block lists or the bot's persona.
+    // open up: .admin/.mode (owner-only, no exceptions), anything that
+    // mutates a PERSISTED setting, and anything that reveals the bot's
+    // saved data. Public mode opens read-only commands (.menu/.ping/.alive/
+    // .settings), the speaker-local .clear, .save/.vv, and the already
+    // admin-gated moderation commands — never the feature toggles. Without
+    // this a stranger could flip .chatai/.antidelete/.autostatus off (or
+    // .antilink/.groupadmin on) for the whole account from any group.
     const OWNER_ONLY_CMDS = new Set(['admin', 'mode']);
-    const PERSIST_CMDS = new Set(['allow', 'block', 'persona']);
+    const PERSIST_CMDS = new Set(['allow', 'block', 'persona', 'chatai', 'autoreply', 'autostatus', 'statusreact', 'antidelete', 'antideletestatus', 'antitag', 'antitagstatus', 'antilink', 'groupadmin']);
     const publicMode = !isOwner && userSettings.mode === 'public' && !OWNER_ONLY_CMDS.has(cmd) && !PERSIST_CMDS.has(cmd);
     // Group admins (not in the list) may only use group moderation commands.
     const MOD_CMDS = new Set(['kick', 'promote', 'demote', 'mute', 'unmute', 'tagall']);
     if (MOD_CMDS.has(cmd)) {
         if (userSettings.groupAdmin === false) {
+            return;
+        }
+        // Moderation always needs group-admin rights from the SENDER (the
+        // linked phone excepted). Public mode used to open .kick/.mute to
+        // anyone in the group, since it bypasses the auth gate below.
+        if (!isOwner && !(await isGroupAdmin(sock, jid, senderNum))) {
             return;
         }
     }
@@ -321,7 +392,9 @@ ${DIV}${FOOT}`);
             break;
         }
 
-        case 'clear': {
+        case 'clear':
+        case 'reset':   // undocumented aliases of .clear — used to be silent no-ops
+        case 'new': {
             // Per-speaker key must match the one askGroq uses (audit L20)
             clearHistory(historyKey(jid, m.key.participant));
             await reply(
@@ -810,6 +883,139 @@ ${DIV}${FOOT}`);
                     meta.participants.map(p => `@${p.id.split('@')[0]}`).join(' '),
                 mentions: meta.participants.map(p => p.id)
             });
+            break;
+        }
+
+        // ── Fun ────────────────────────────────────────────────────────────
+        // All read-only — available in public mode on purpose.
+        case 'flip': {
+            const heads = Math.random() < 0.5;
+            await reply(
+`*🪙 ${fb('COIN FLIP')}
+${DIV}
+🪙 ${heads ? '*HEADS*' : '*TAILS*'}
+${DIV}${FOOT}`);
+            break;
+        }
+
+        case 'roll': {
+            // .roll or .roll NdM (e.g. .roll 2d20) — capped so the reply stays sane
+            const m2 = (parts[0] || '').toLowerCase().match(/^(\d{1,3})d(\d{1,4})$/);
+            if (parts[0] && !m2) {
+                await reply(
+`*🎲 ${fb('ROLL')}
+${DIV}
+Usage: .roll or .roll 2d20
+${DIV}${FOOT}`);
+                break;
+            }
+            const count = m2 ? Math.min(parseInt(m2[1], 10), 100) : 1;
+            const sides = m2 ? Math.min(parseInt(m2[2], 10), 1000) : 6;
+            const rolls = Array.from({ length: count }, () => Math.floor(Math.random() * sides) + 1);
+            const total = rolls.reduce((a, b) => a + b, 0);
+            await reply(
+`*🎲 ${fb('ROLL')}
+${DIV}
+🎲 ${count}d${sides}: *${total}*${rolls.length > 1 ? ' (' + rolls.join(' + ') + ')' : ''}
+${DIV}${FOOT}`);
+            break;
+        }
+
+        case 'pick': {
+            const opts = parts.join(' ').split(',').map(s => s.trim()).filter(Boolean);
+            if (opts.length < 2) {
+                await reply(
+`*🎯 ${fb('PICK')}
+${DIV}
+Give me options, comma separated:
+
+.pick jollof, fried rice, waakye
+${DIV}${FOOT}`);
+                break;
+            }
+            const chosen = opts[Math.floor(Math.random() * opts.length)];
+            await reply(
+`*🎯 ${fb('PICK')}
+${DIV}
+From ${opts.length} options, I choose: *${chosen}*
+${DIV}${FOOT}`);
+            break;
+        }
+
+        case '8ball': {
+            const q = parts.join(' ');
+            if (!q) {
+                await reply(
+`*🔮 ${fb('MAGIC 8-BALL')}
+${DIV}
+Ask me something:
+
+.8ball will I pass my exam?
+${DIV}${FOOT}`);
+                break;
+            }
+            const a = EIGHT_BALL[Math.floor(Math.random() * EIGHT_BALL.length)];
+            await reply(
+`*🔮 ${fb('MAGIC 8-BALL')}
+${DIV}
+❓ _${q}_
+🔮 ${a}
+${DIV}${FOOT}`);
+            break;
+        }
+
+        case 'love': {
+            // Tag one person (or two — ships the tagged pair). The same pair
+            // always scores the same: it's fate, not luck.
+            const mentions = m.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+            const a = mentions[0] || m.key.participant || senderNum;
+            const b = mentions[1] || (mentions[0] ? (m.key.participant || senderNum) : null);
+            const nm = (j) => { const s = String(j || '?'); return s.includes('@') ? s.split('@')[0] : s; };
+            if (!b || nm(a) === nm(b)) {
+                await reply(
+`*💖 ${fb('LOVE METER')}
+${DIV}
+Tag someone:
+
+.love @user
+${DIV}${FOOT}`);
+                break;
+            }
+            const pair = [String(a), String(b)].sort().join('|');
+            let h = 0;
+            for (const c of pair) h = (h * 31 + c.codePointAt(0)) >>> 0;
+            const pct = 40 + (h % 61); // 40–100% — love is optimistic
+            const hearts = '💖'.repeat(Math.round(pct / 20));
+            const verdict = pct >= 80 ? 'Matched in heaven! 💍'
+                : pct >= 60 ? 'Strong vibes. Put a ring on it soon.'
+                : "It's complicated. Biblically.";
+            await reply(
+`*💖 ${fb('LOVE METER')}
+${DIV}
+${nm(a)} 💖 ${nm(b)}
+${hearts} *${pct}%*
+_${verdict}_
+${DIV}${FOOT}`);
+            break;
+        }
+
+        case 'joke': {
+            const j = JOKES[Math.floor(Math.random() * JOKES.length)];
+            await reply(
+`*😂 ${fb('JOKE')}
+${DIV}
+${j}
+${DIV}${FOOT}`);
+            break;
+        }
+
+        case 'quote': {
+            const q = QUOTES[Math.floor(Math.random() * QUOTES.length)];
+            await reply(
+`*💭 ${fb('QUOTE')}
+${DIV}
+_${q}_
+${DIV}${FOOT}`);
             break;
         }
 
