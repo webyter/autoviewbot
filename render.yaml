@@ -3,7 +3,7 @@ services:
     name: autoviewer-platform
     runtime: node
     region: oregon
-    plan: starter
+    plan: free
     buildCommand: npm install
     startCommand: node autoviewer.js
     healthCheckPath: /health
@@ -26,7 +26,3 @@ services:
         generateValue: true
       - key: PUBLIC_URL
         sync: false
-    disk:
-      name: session-data
-      mountPath: /opt/render/project/src/session
-      sizeGB: 1
