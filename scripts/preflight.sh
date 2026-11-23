@@ -124,8 +124,38 @@ if command -v systemctl >/dev/null 2>&1 && printf '%s' "$UNITS" | grep -q "autov
         fi ;;
     *)                      caution "service cookie setting: not pinned" ;;
   esac
+elif command -v pm2 >/dev/null 2>&1 && pm2 jlist 2>/dev/null | grep -q '"name":"autoviewer"'; then
+  pm2_status="$(pm2 jlist 2>/dev/null | node -e '
+    try {
+      const list = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      const app = list.find(a => a.name === "autoviewer");
+      console.log(app ? app.pm2_env.status : "unknown");
+    } catch { console.log("unknown"); }
+  ')"
+  if [ "$pm2_status" = "online" ]; then
+    pass "autoviewer is online under PM2"
+  else
+    caution "autoviewer is $pm2_status under PM2"
+  fi
+  if systemctl is-enabled pm2-ubuntu.service >/dev/null 2>&1; then
+    pass "PM2 startup enabled on boot (pm2-ubuntu.service)"
+  else
+    caution "PM2 startup not enabled — run: pm2 startup"
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 5 "http://127.0.0.1:$PORT_ABS/health" >/dev/null 2>&1; then
+      pass "health endpoint responds"
+    else
+      error "health endpoint did not respond on port $PORT_ABS"
+    fi
+  fi
+  CS="${COOKIE_SECURE:-$(envval COOKIE_SECURE)}"
+  if [ "$CS" = "true" ]; then pass "session cookie: secure"
+  elif [ "$CS" = "false" ]; then caution "session cookie: NOT secure (fine over plain HTTP, wrong behind TLS)"
+  elif [ "$(envval NODE_ENV)" = "production" ]; then pass "session cookie: secure (NODE_ENV=production)"
+  else pass "session cookie: insecure (development)"; fi
 else
-  caution "autoviewer.service not installed"
+  caution "autoviewer service not installed"
   # No service → judge the cookie from this shell's environment or .env.
   CS="${COOKIE_SECURE:-$(envval COOKIE_SECURE)}"
   if [ "$CS" = "true" ]; then pass "session cookie: secure"
