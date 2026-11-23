@@ -1,0 +1,41 @@
+{
+  "name": "autoviewer",
+  "version": "1.0.0",
+  "description": "AutoViewer \u2014 Multi-user WhatsApp automation platform with per-user settings, QR linking, auto-status, and ChatAI.",
+  "main": "autoviewer.js",
+  "scripts": {
+    "start": "node autoviewer.js",
+    "test": "node test/project-fixes.js && node test/quoted-media.js && node test/media-metadata.js && node test/creds-presence-guard.js && node test/notification-presence.js && node test/command-regressions.js && node test/status-reaction.js && node test/status-crypto.js && node test/status-content.js && node test/status-ack.js && node test/session-heal.js && node test/smoke.js && node test/media.js && node test/media-stream.js && node test/features.js && node test/worker-boot.js && node test/pages.js && node test/keepalive.js && node test/render-config.js && node test/groq-key.js && node test/compat-api.js",
+    "render:init": "node scripts/render-config.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/webyter/autoviewbot.git"
+  },
+  "keywords": [
+    "autoviewer",
+    "whatsapp-bot",
+    "baileys",
+    "multi-user",
+    "whatsapp",
+    "nodejs",
+    "auto-status"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "axios": "^1.21.0",
+    "bcrypt": "^6.0.0",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.2",
+    "express-session": "^1.19.0",
+    "https-proxy-agent": "^9.1.0",
+    "pino": "^10.4.0",
+    "qrcode": "^1.5.4",
+    "socks-proxy-agent": "^10.1.0"
+  }
+}

@@ -1,0 +1,1808 @@
+/**
+ * AutoViewer — Bot Worker
+ * Handles individual WhatsApp connections and automation logic.
+ */
+
+// WhatsApp auth-state files are credentials: keep everything this worker
+// writes private to the service user (inherited by forked children too).
+process.umask(0o077);
+
+const P = require('pino');
+const fs = require('fs');
+const path = require('path');
+const { askGroq, clearHistory, transcribeVoice } = require('./lib/groqAI');
+const { RecoveryCache } = require('./lib/store');
+// Dot-command engine — ported from the GitHub version (see commands.js header).
+const makeHandleOwnerCommand = require('./commands');
+
+const userId = process.argv[2];
+if (!userId) process.exit(1);
+
+let pendingPhoneNumber = process.argv[3] ? String(process.argv[3]).replace(/\D/g, '') : null;
+let isPairingCodeRequested = false;
+
+const SESSION_BASE = process.env.SESSION_DIR || path.join(__dirname, 'session');
+const sessionDir = path.join(SESSION_BASE, userId);
+if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+const DB_PATH = path.join(SESSION_BASE, 'users.json');
+
+let Baileys;
+let jidNormalizedUser = (jid) => {
+    if (!jid) return '';
+    const [user, server] = String(jid).split('@');
+    if (!server) return user;
+    return `${user.split(':')[0]}@${server === 'c.us' ? 's.whatsapp.net' : server}`;
+};
+
+async function loadBaileys() {
+    if (!Baileys) {
+        Baileys = await import('@whiskeysockets/baileys');
+        if (Baileys.jidNormalizedUser) jidNormalizedUser = Baileys.jidNormalizedUser;
+    }
+    return Baileys;
+}
+
+// Force IPv4 — Node.js v22 Happy Eyeballs breaks on some hosts with unreachable IPv6
+const https = require('https');
+let connectAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 10000 });
+
+// Proxy Support (overrides IPv4 agent if set)
+try {
+    const proxyUrl = process.env.SOCKS5_PROXY || process.env.HTTPS_PROXY || process.env.PROXY || process.env.ALL_PROXY || '';
+    if (proxyUrl) {
+        if (proxyUrl.startsWith('socks')) {
+            const { SocksProxyAgent } = require('socks-proxy-agent');
+            connectAgent = new SocksProxyAgent(proxyUrl);
+        } else {
+            const { HttpsProxyAgent } = require('https-proxy-agent');
+            connectAgent = new HttpsProxyAgent(proxyUrl);
+        }
+        console.log(`[Worker:${userId}] Using proxy: ${proxyUrl.replace(/\/\/.*@/, '//***@')}`);
+    }
+} catch (e) {
+    process.stderr.write(`[Worker:${userId}] Proxy setup failed: ${e.message}\n`);
+}
+
+// Unwrap view-once wrappers so the inner media/text content is reachable
+function unwrapContent(msg) {
+    let m = msg;
+    // Full envelope chain (audit M11): ephemeral/view-once/document-with-
+    // caption/edited/group-mentioned wrappers all hide the real content.
+    // Without this, ephemeral statuses collide to signature 'txt:' (dedup
+    // suppresses reactions for the TTL) and anti-link/autoreply read empty
+    // text. Mirrors lib/media.js unwrapMessage; loops are bounded.
+    for (let i = 0; m && i < 8; i++) {
+        if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+        else if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+        else if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+        else if (m.viewOnceMessageV2Extension?.message) m = m.viewOnceMessageV2Extension.message;
+        else if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+        else if (m.editedMessage?.message) m = m.editedMessage.message;
+        else if (m.groupMentionedMessage?.message) m = m.groupMentionedMessage.message;
+        else break;
+    }
+    return m;
+}
+
+// Resolve a LID (e.g. 123...@lid) to the contact's real phone jid.
+// WhatsApp delivers the LID user's real PN alongside the key:
+//   - statuses / 1:1 chats: key.remoteJidAlt
+//   - groups:              key.participantAlt
+// Fall back to Baileys' LID mapping store, then to the raw author jid.
+// Results are memoized per-process — statuses arrive in bursts.
+// IMPORTANT: only truthy results are cached. The mapping store returns null
+// for not-yet-synced LIDs, and those resolve later (alt fields, history sync).
+// Caching null would permanently skip the author AND keep the status never-viewed.
+const _lidPnCache = new Map();
+async function resolveAuthorJid(sock, key) {
+    try {
+        const { isLidUser, isPnUser, jidNormalizedUser } = await loadBaileys();
+        let author = key.participant || (key.remoteJid !== 'status@broadcast' ? key.remoteJid : null);
+        if (!author && key.participantAlt) author = key.participantAlt;
+        if (!author && key.remoteJidAlt && key.remoteJidAlt !== 'status@broadcast') author = key.remoteJidAlt;
+        if (!author) return null;
+        const alt = key.participantAlt || (key.remoteJidAlt !== 'status@broadcast' ? key.remoteJidAlt : null);
+        if (isLidUser(author)) {
+            if (alt && isPnUser(alt)) {
+                const norm = jidNormalizedUser(alt);
+                _lidPnCache.set(author, norm);
+                if (_lidPnCache.size > 500) { const firstKey = _lidPnCache.keys().next().value; _lidPnCache.delete(firstKey); }
+                return norm;
+            }
+            if (_lidPnCache.has(author)) return _lidPnCache.get(author);
+            if (sock.signalRepository?.lidMapping?.getPNForLID) {
+                const res = await sock.signalRepository.lidMapping.getPNForLID(author);
+                if (res) {
+                    const norm = jidNormalizedUser(res);
+                    _lidPnCache.set(author, norm);
+                    if (_lidPnCache.size > 500) { const firstKey = _lidPnCache.keys().next().value; _lidPnCache.delete(firstKey); }
+                    return norm;
+                }
+            }
+            return null;
+        }
+        return jidNormalizedUser(author);
+    } catch { return null; }
+}
+
+// Function to thoroughly mark a status broadcast as viewed:
+// 1. Sends explicit 'read' receipt to status author so contact sees user in "Viewed by"
+// 2. Sends explicit 'read-self' receipt so user's phone marks status viewed in Updates tab
+// 3. Sends 'played' receipt for media stories (videos/audios)
+// 4. Calls Baileys native readMessages with raw m.key and candidate author key
+async function markStatusAsViewed(sock, m) {
+    if (!sock || !m || !m.key || m.key.remoteJid !== 'status@broadcast') return;
+    const statusId = m.key.id;
+    if (!statusId) return;
+
+    const selfJid = sock.authState?.creds?.me?.id ? jidNormalizedUser(sock.authState.creds.me.id) : (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
+    const selfLid = sock.authState?.creds?.me?.lid ? jidNormalizedUser(sock.authState.creds.me.lid) : (sock.user?.lid ? jidNormalizedUser(sock.user.lid) : null);
+
+    const rawParticipant = m.key.participant || m.participant || (m.key.fromMe ? (selfLid || selfJid) : null);
+    if (!m.key.participant && rawParticipant) m.key.participant = rawParticipant;
+    const authorJid = await resolveAuthorJid(sock, m.key).catch(() => null) || (m.key.fromMe ? selfJid : null);
+
+    const candidates = Array.from(new Set([
+        rawParticipant,
+        authorJid,
+        m.key.remoteJidAlt,
+        m.key.participantAlt,
+        m.key.fromMe ? selfJid : null,
+        m.key.fromMe ? selfLid : null
+    ].filter(j => j && j !== 'status@broadcast' && !j.endsWith('@g.us'))));
+
+    if (candidates.length === 0 && rawParticipant) {
+        candidates.push(rawParticipant);
+    }
+
+    // 1. Direct receipts for all candidate representations of the participant
+    for (const p of candidates) {
+        // Read receipt: signals the author's device that status was viewed
+        try {
+            if (typeof sock.sendReceipt === 'function') {
+                await sock.sendReceipt('status@broadcast', p, [statusId], 'read');
+            }
+        } catch (e) {
+            console.error(`[Status] sendReceipt (read) to ${p.split('@')[0]} failed:`, e.message);
+        }
+
+        // Read-self receipt: ONLY for own statuses.
+        // For external contacts, sending read-self overwrites the public 'read'
+        // receipt on WhatsApp servers, turning the view anonymous (hiding from the viewer list).
+        if (m.key.fromMe) {
+            try {
+                if (typeof sock.sendReceipt === 'function') {
+                    await sock.sendReceipt('status@broadcast', p, [statusId], 'read-self');
+                }
+            } catch (e) {
+                console.error(`[Status] sendReceipt (read-self) to ${p.split('@')[0]} failed:`, e.message);
+            }
+        }
+
+        // Played receipt for media statuses (videos/audios)
+        const isMedia = Boolean(m.message?.videoMessage || m.message?.audioMessage);
+        if (isMedia) {
+            try {
+                if (typeof sock.sendReceipt === 'function') {
+                    await sock.sendReceipt('status@broadcast', p, [statusId], 'played');
+                }
+            } catch (e) {}
+        }
+    }
+
+    // 2. Native Baileys readMessages with fromMe: false
+    // (Baileys' aggregateMessageKeysNotFromMe discards keys with fromMe: true,
+    // so we pass fromMe: false to ensure the receipt is dispatched)
+    const baseKey = {
+        remoteJid: 'status@broadcast',
+        id: statusId,
+        fromMe: false,
+        participant: m.key.participant || candidates[0]
+    };
+
+    try {
+        await sock.readMessages([baseKey]);
+    } catch (e) {
+        console.error('[Status] readMessages (baseKey) failed:', e.message);
+    }
+
+    // 3. Native Baileys readMessages with resolved authorJid if different from participant
+    if (authorJid && authorJid !== baseKey.participant) {
+        try {
+            await sock.readMessages([{ ...baseKey, participant: authorJid }]);
+        } catch (e) {
+            console.error('[Status] readMessages (author key) failed:', e.message);
+        }
+    }
+
+    const displayNum = (authorJid || rawParticipant || 'me').split('@')[0];
+    console.log(`[Status] Viewed: ${displayNum}${m.key.fromMe ? ' (own status)' : ''} (${statusId})`);
+}
+
+// Fingerprint a message's content — used to dedup status delete alerts.
+// WhatsApp re-delivers unviewed statuses with FRESH key ids but the same
+// media/text, so one deleted status can otherwise alert N times.
+function msgSignature(msg) {
+    const c = unwrapContent(msg.message) || {};
+    if (c.imageMessage) return 'img:' + (c.imageMessage.mediaKey || c.imageMessage.url || c.imageMessage.fileLength || '');
+    if (c.videoMessage) return 'vid:' + (c.videoMessage.mediaKey || c.videoMessage.url || c.videoMessage.fileLength || '');
+    if (c.audioMessage) return 'aud:' + (c.audioMessage.mediaKey || c.audioMessage.url || c.audioMessage.fileLength || '');
+    if (c.documentMessage) return 'doc:' + (c.documentMessage.mediaKey || c.documentMessage.url || c.documentMessage.fileName || '');
+    if (c.stickerMessage) return 'stk:' + (c.stickerMessage.mediaKey || c.stickerMessage.url || '');
+    return 'txt:' + (c.conversation || c.extendedTextMessage?.text || c.conversationMessage?.message || '');
+}
+
+async function prepareRecoveredContent(sock, oldMsg, displayJid, isStatus) {
+    const content = unwrapContent(oldMsg.message) || {};
+    const who = displayJid ? displayJid.split('@')[0] : 'unknown';
+    const mentions = displayJid ? [displayJid] : undefined;
+    const mediaType = content.imageMessage ? 'image'
+        : content.videoMessage ? 'video'
+        : content.audioMessage ? 'audio'
+        : content.stickerMessage ? 'sticker'
+        : content.documentMessage ? 'document'
+        : null;
+    if (mediaType) {
+        // Media is ENCRYPTED on WhatsApp's servers — fetching the raw url
+        // returns ciphertext that WhatsApp rejects as invalid media on
+        // re-upload. Must download + decrypt.
+        // Use lib/media: it handles directPath-only media and re-requests the
+        // media from the sender's device on 404/410.
+        const { downloadMediaToFile, extractMedia } = require('./lib/media');
+        const ex = extractMedia(oldMsg.message);
+        const protoKey = ex.protoKey || `${mediaType}Message`;
+        const BaileysMod = await loadBaileys();
+        let file = null;
+        try {
+            file = await downloadMediaToFile(sock, BaileysMod, {
+                key: oldMsg.key,
+                media: ex.media || content[protoKey],
+                protoKey,
+                timeoutMs: 15000
+            });
+            const msg = { [mediaType]: { url: file.path } };
+            if (mediaType === 'image' || mediaType === 'video') {
+                const origCaption = content.imageMessage?.caption || content.videoMessage?.caption || '';
+                msg.caption = (isStatus ? `📌 *Recovered status* from @${who}` : '') + (origCaption ? (isStatus ? '\n' : '') + origCaption : '');
+                if (mentions) msg.mentions = mentions;
+            } else if (mediaType === 'audio') {
+                msg.mimetype = content.audioMessage?.mimetype || 'audio/mpeg';
+                msg.ptt = !!content.audioMessage?.ptt;
+            } else if (mediaType === 'document') {
+                msg.mimetype = content.documentMessage?.mimetype || 'application/octet-stream';
+                msg.fileName = content.documentMessage?.fileName || 'recovered';
+            }
+            return { msg, cleanup: () => file?.cleanup?.() };
+        } catch (downloadErr) {
+            console.error(`[Anti-Delete] Media download failed for ${who}:`, downloadErr.message);
+            // Fallback: Check if embedded jpegThumbnail exists in the media object
+            const rawMedia = ex.media || content[protoKey] || {};
+            const thumb = rawMedia.jpegThumbnail;
+            if (thumb && (mediaType === 'image' || mediaType === 'video')) {
+                const thumbBuf = Buffer.isBuffer(thumb) ? thumb : (typeof thumb === 'string' ? Buffer.from(thumb, 'base64') : null);
+                if (thumbBuf && thumbBuf.length > 0) {
+                    const origCaption = content.imageMessage?.caption || content.videoMessage?.caption || '';
+                    const caption = `📌 *Recovered ${isStatus ? 'status' : 'media'} (preview)* from @${who}\n_(Full media was already removed from WhatsApp servers)_` + (origCaption ? `\n\n${origCaption}` : '');
+                    return { msg: { image: thumbBuf, caption, mentions }, cleanup: null };
+                }
+            }
+            const origCaption = content.imageMessage?.caption || content.videoMessage?.caption || content.documentMessage?.caption || '';
+            if (origCaption) {
+                return { msg: { text: `📌 *Recovered ${isStatus ? 'status' : 'message'} (caption)* from @${who}\n\n${origCaption}`, mentions }, cleanup: null };
+            }
+            return { raw: oldMsg, cleanup: null };
+        }
+    }
+    const txt = content.conversation || content.extendedTextMessage?.text || content.conversationMessage?.message || '';
+    if (txt) {
+        const msg = { text: (isStatus ? `📌 *Recovered status* from @${who}\n\n` : '') + txt };
+        if (mentions) msg.mentions = mentions;
+        return { msg, cleanup: null };
+    }
+    // Unknown type — fall back to forwarding the raw original
+    return { raw: oldMsg, cleanup: null };
+}
+
+async function recoverDeletedContent(sock, ownerJid, oldMsg, displayJid, isStatus) {
+    const rec = await prepareRecoveredContent(sock, oldMsg, displayJid, isStatus);
+    try {
+        if (rec?.msg) return await sock.sendMessage(ownerJid, rec.msg);
+        if (rec?.raw) return await copyNForward(sock, ownerJid, rec.raw);
+    } finally {
+        if (rec?.cleanup) rec.cleanup();
+    }
+}
+const copyNForward = require('./lib/forward');
+
+// Benign libsignal noise: "Bad MAC" = a decryption retry that WhatsApp
+// automatically re-delivers. It self-heals and just floods the log.
+const BENIGN_PATTERNS = [/Decrypted.*closed session/, /Closing open session/];
+
+// JIDs whose stale Signal session was already healed this worker lifetime.
+// One heal attempt per JID — a broken session either heals on the first
+// forced key exchange or the problem isn't a stale session.
+const healedSessions = new Set();
+const logFwd = (...args) => {
+    try {
+        // Join ALL arguments: console.error('x', e.message) is the common
+        // shape and forwarding only the first arg silently dropped the
+        // error detail (errors showed up as "reveal failed:" with no reason).
+        const str = args.map(a => {
+            if (a instanceof Error) return a.stack || a.message || String(a);
+            if (typeof a === 'object' && a !== null) {
+                try { return JSON.stringify(a); } catch { return String(a); }
+            }
+            return String(a);
+        }).join(' ');
+        if (BENIGN_PATTERNS.some(p => p.test(str))) return;
+        process.send({ type: 'LOG', data: str });
+    } catch {}
+};
+console.log = logFwd;
+console.warn = logFwd;
+console.error = logFwd;
+
+const SETTINGS_KEYS = ['autoreply', 'autostatus', 'statusReact', 'reactEmojis', 'antideleteMsg', 'antideleteStatus', 'antiTagStatus', 'antivv', 'presence', 'mode', 'anticall', 'botName', 'botInstructions', 'antilink', 'groupAdmin', 'groupChatAI', 'allow', 'block', 'persona', 'admins', 'commandPrefix', 'voiceNotes'];
+let userSettings = {
+    autoreply: false,
+    autostatus: true,
+    statusReact: true,
+    antiTagStatus: false,
+    antivv: true,
+    antilink: false,
+    groupAdmin: false,
+    groupChatAI: false,
+    voiceNotes: false,
+    commandPrefix: '.',
+    reactEmojis: '❤️,🖤,💚,🤍,💙,🩷,🩵',
+    presence: 'auto',
+    mode: 'self',       // command access: self (owner/admins) or public
+    anticall: false,
+    botName: '',
+    botInstructions: '',
+    // Command-managed settings (dot commands, ported from GitHub version)
+    allow: [],      // ChatAI allowlist (numbers). Empty = reply to everyone.
+    block: [],      // ChatAI blocklist (numbers). Always wins over allow.
+    persona: '',    // owner-defined persona text for ChatAI (max 300 chars)
+    admins: [],     // trusted numbers that may run bot commands
+};
+
+function refreshSettings() {
+    try {
+        if (fs.existsSync(DB_PATH)) {
+            const db = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+            if (db[userId]) {
+                for (const key of SETTINGS_KEYS) {
+                    if (key in db[userId]) userSettings[key] = db[userId][key];
+                }
+                // Backward-compat: legacy single 'antidelete' -> split flags
+                if ('antidelete' in db[userId]) {
+                    if (!('antideleteMsg' in db[userId])) userSettings.antideleteMsg = db[userId].antidelete;
+                    if (!('antideleteStatus' in db[userId])) userSettings.antideleteStatus = db[userId].antidelete;
+                }
+            }
+        }
+    } catch (e) {
+        console.error(`[Worker:${userId}] Settings Refresh Error:`, e.message);
+    }
+}
+
+function sendToParent(msg) {
+    try { process.send(msg); } catch {}
+}
+
+// proto is destructured inside start(); captured here for the command module.
+let _proto = null;
+const handleOwnerCommand = makeHandleOwnerCommand({
+    userSettings,
+    sendToParent,
+    loadBaileys,
+    clearHistory,
+    getCurrentSocket: () => currentSocket,
+    // Facades that fall back to the durable cache when the in-memory map
+    // misses (e.g. after a restart) — this is what makes `.vv` / `.save`
+    // work for media that arrived before the bot was restarted.
+    getStatusStore: () => _statusStoreFacade,
+    getMsgStore: () => _msgStoreFacade,
+    markStatusAsViewed: (sock, m) => markStatusAsViewed(sock, m),
+    getOwnerJid: () => _ownerJid,
+    getProto: () => _proto,
+    copyNForward: require('./lib/forward'),
+    historyKey: require('./lib/groqAI').historyKey
+});
+
+const _msgStoreFacade = {
+    get size() { return _msgStore.size; },
+    has(id) { return _msgStore.has(id) || !!_recoveryCache.getMessage(id); },
+    get(id) {
+        const hit = _msgStore.get(id);
+        if (hit) return hit;
+        const e = _recoveryCache.getMessage(id);
+        if (!e) return undefined;
+        return { key: e.key, message: e.message, participant: e.key?.participant || '' };
+    },
+    delete(id) { _msgStore.delete(id); }
+};
+const _statusStoreFacade = {
+    get size() { return _statusMsgStore.size; },
+    has(id) { return _statusMsgStore.has(id) || !!_recoveryCache.getStatus(id); },
+    get(id) {
+        const hit = _statusMsgStore.get(id);
+        if (hit) return hit;
+        const e = _recoveryCache.getStatus(id);
+        if (!e) return undefined;
+        // ts matters: `.save` picks the NEWEST status, so a restored entry
+        // without its original timestamp would look like "just now".
+        return { key: e.key, message: e.message, participant: e.key?.participant || '', ts: e.ts };
+    },
+    *values() {
+        for (const v of _statusMsgStore.values()) yield v;
+        for (const e of _recoveryCache.listStatuses()) {
+            if (_statusMsgStore.has(e.id)) continue;
+            yield { key: e.key, message: e.message, participant: e.key?.participant || '', ts: e.ts };
+        }
+    }
+};
+
+let presenceTimer = null;       // presence re-assert for typing/recording + online
+let pokeTimer = null;           // single pending delayed presence poke
+let lastChatJid = null;         // most recent 1:1 chat, target for typing/recording
+let lastReactAt = 0;            // batch-wide throttle for status reactions
+
+function clearPresence() {
+    if (presenceTimer) {
+        clearInterval(presenceTimer);
+        presenceTimer = null;
+    }
+    if (pokeTimer) {
+        clearTimeout(pokeTimer);
+        pokeTimer = null;
+    }
+}
+
+// Immediate presence push (used when a new chat messages the bot, so typing
+// shows up instantly instead of waiting for the next presence push).
+function pokePresence(sock) {
+    if (!sock) return;
+    const mode = userSettings.presence || 'auto';
+    if (mode === 'typing' || mode === 'recording') {
+        const jid = lastChatJid;
+        if (!jid) return;
+        const action = mode === 'typing' ? 'composing' : 'recording';
+        sock.sendPresenceUpdate(action, jid)
+            .then(() => console.log(`[Presence] ${action} -> ${jid.split('@')[0]}`))
+            .catch(e => console.error('[Presence] Error:', e.message));
+    } else if (mode === 'online') {
+        if (sock.authState?.creds?.me && !sock.authState.creds.me.name) {
+            sock.authState.creds.me.name = sock.user?.name || userSettings.botName || 'WhatsApp User';
+        }
+        sock.sendPresenceUpdate('available')
+            .catch(e => console.error('[Presence] Error:', e.message));
+    }
+}
+
+function applyPresence(sock) {
+    clearPresence();
+    if (!sock) return;
+    const mode = userSettings.presence || 'auto';
+
+    // Ensure Baileys has a name in creds.me so sendPresenceUpdate won't reject available/unavailable
+    if (sock.authState?.creds?.me && !sock.authState.creds.me.name) {
+        sock.authState.creds.me.name = sock.user?.name || userSettings.botName || 'WhatsApp User';
+    }
+
+    if (mode === 'typing' || mode === 'recording') {
+        // WhatsApp 'composing'/'recording' are per-chat and require a target jid.
+        // Only run once a real 1:1 chat has messaged us (lastChatJid) — the poke
+        // on incoming messages handles the first chat. Pushing to our own jid
+        // at startup is useless.
+        const jid = lastChatJid;
+        if (!jid) return;
+        const action = mode === 'typing' ? 'composing' : 'recording';
+        // Single poke — WhatsApp auto-expires the indicator after ~15s.
+        // Deliberately NOT re-asserted: perpetual typing in a chat makes
+        // WhatsApp treat it as "active on another device" and mute the
+        // owner's phone notifications for that chat.
+        sock.sendPresenceUpdate(action, jid)
+            .catch(e => console.error('[Presence] Error:', e.message));
+    } else if (mode === 'online' || mode === 'available') {
+        const push = async () => {
+            try { await sock.sendPresenceUpdate('available'); } catch (e) { console.error('[Presence] Error:', e.message); }
+        };
+        push();
+        // Re-assert 'available' continuously so no reconnect, race, or
+        // server-side expiry can ever leave the account showing as offline.
+        presenceTimer = setInterval(push, 25000);
+        if (presenceTimer.unref) presenceTimer.unref();
+    } else {
+        const push = async () => {
+            try { await sock.sendPresenceUpdate('unavailable'); } catch (e) { console.error('[Presence] Error:', e.message); }
+        };
+        push();
+        // Reassert inactive presence after activity/reconnects, including an
+        // online -> auto settings change. Doing nothing leaves the companion
+        // active and can suppress notifications on the primary phone.
+        presenceTimer = setInterval(push, 25000);
+        if (presenceTimer.unref) presenceTimer.unref();
+        console.log('[Presence] Phone notifications: companion kept unavailable');
+    }
+}
+async function triggerPairingCode(sock, phone) {
+    if (!sock || !phone || isPairingCodeRequested || hasSession) return;
+    if (sock.authState?.creds?.registered) return;
+    isPairingCodeRequested = true;
+    try {
+        console.log(`[Worker:${userId}] Requesting pairing code for +${phone}...`);
+        const code = await sock.requestPairingCode(phone);
+        sendToParent({ type: 'PAIRING_CODE', code, phone });
+        console.log(`[Worker:${userId}] Pairing code generated: ${code}`);
+    } catch (e) {
+        isPairingCodeRequested = false;
+        console.error(`[Worker:${userId}] Failed to request pairing code:`, e.message);
+        sendToParent({ type: 'ERROR', code: 500, message: `Pairing code request failed: ${e.message}` });
+    }
+}
+
+process.on('message', async (msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === 'GROQ_API_KEY') {
+        if (msg.key) process.env.GROQ_API_KEY = msg.key;
+        else delete process.env.GROQ_API_KEY;
+        return;
+    }
+    if (msg.type === 'SEND_NOTIFICATION') {
+        const text = msg.text || '';
+        const ownerJid = _ownerJid || (currentSocket?.authState?.creds?.me?.id ? jidNormalizedUser(currentSocket.authState.creds.me.id) : null);
+        if (currentSocket && ownerJid && text) {
+            currentSocket.sendMessage(ownerJid, { text })
+                .then(() => {
+                    sendToParent({ type: 'NOTIFICATION_DELIVERED', notificationId: msg.notificationId });
+                })
+                .catch((e) => console.error(`[Worker:${userId}] Notification send failed:`, e.message));
+        }
+        return;
+    }
+    if (msg.type === 'REQUEST_PAIRING_CODE') {
+        const phone = String(msg.phoneNumber || '').replace(/\D/g, '');
+        if (phone) {
+            pendingPhoneNumber = phone;
+            isPairingCodeRequested = false;
+            if (currentSocket && !hasSession && !currentSocket.authState?.creds?.registered) {
+                await triggerPairingCode(currentSocket, phone);
+            }
+        } else {
+            pendingPhoneNumber = null;
+            isPairingCodeRequested = false;
+        }
+        return;
+    }
+    if (msg.type !== 'SETTINGS' || !msg.settings || typeof msg.settings !== 'object') return;
+    for (const key of SETTINGS_KEYS) {
+        if (key in msg.settings && msg.settings[key] !== undefined) userSettings[key] = msg.settings[key];
+    }
+    if ('presence' in msg.settings && currentSocket) {
+        applyPresence(currentSocket);
+    }
+    sendToParent({ type: 'LOG', data: 'Settings updated' });
+});
+
+
+// Load initial
+refreshSettings();
+
+let retryCount = 0;
+const MAX_RETRIES = 15;
+const BASE_DELAY = 2000;
+const QR_RETRY_DELAY = 15000; // 15s between QR retries (no session yet)
+const RATE_LIMIT_DELAY = 30000; // 30s base delay for rate-limit (405)
+let hasSession = false; // set to true once we've had a successful login
+
+let starting = false;
+let startingTimer = null;
+let reconnectTimer = null;
+let currentSocket = null;
+let _ownerJid = null;           // linked account's real PN jid (LID-safe), set in start()
+
+// Hoisted state that survives reconnect cycles
+const _msgStore = new Map();       // recent 1:1/group messages for anti-delete
+const _statusMsgStore = new Map(); // recent status deliveries for anti-delete
+// Durable (disk-backed) mirror of the two caches above. The in-memory maps
+// stay the hot path; the file is the cold copy that survives a restart, so
+// `.vv` and anti-delete can still recover a message that arrived before the
+// bot was restarted (see lib/store.js).
+const _recoveryCache = new RecoveryCache({
+    file: path.join(sessionDir, 'recovery-cache.json'),
+    log: (m) => console.log(`[Worker:${userId}] RecoveryCache: ${m}`)
+});
+const _revokedIds = new Set();     // already-alerted delete ids (revokes re-deliver)
+const _alertedStatus = new Map();  // status content signature -> ts (same status re-delivers with fresh ids)
+const STATUS_ALERT_TTL = 60 * 60 * 1000; // dedup window for one status' delete alert
+const _reactedStatus = new Map();  // status content signature -> ts (one reaction per unique status)
+const STATUS_REACT_TTL = 60 * 60 * 1000; // dedup window for one status reaction
+const antilinkWarns = new Map(); // anti-link: "jid:sender" -> strike count (1-2=warned, 3=kick)
+const aiReplyCooldown = new Map(); // cooldown key -> last reply timestamp
+const AI_REPLY_COOLDOWN_MS = 4000;
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, t] of aiReplyCooldown) if (now - t > 60000) aiReplyCooldown.delete(k);
+}, 60000).unref?.();
+
+
+// Periodic in-memory cache purge (every 2 days) so long-running bots don't
+// accumulate message/LID/heal state forever. Purely in-memory: auth/session
+// files and settings are untouched, so the bot stays linked and connected.
+const CACHE_PURGE_MS = 2 * 24 * 60 * 60 * 1000;
+const cachePurgeTimer = setInterval(() => {
+    _lidPnCache.clear();
+    healedSessions.clear();
+    _msgStore.clear();
+    _statusMsgStore.clear();
+    _revokedIds.clear();
+    _alertedStatus.clear();
+    _reactedStatus.clear();
+    console.log(`[Worker:${userId}] Cache purge complete (2-day interval).`);
+}, CACHE_PURGE_MS);
+cachePurgeTimer.unref();
+
+async function start() {
+    if (starting) return;
+    starting = true;
+    // Announce life immediately — prevents the manager's startup watchdog
+    // from killing a slow-but-healthy worker (overloaded host, session-less
+    // account waiting for its first QR, slow WA version fetch, ...)
+    sendToParent({ type: 'STATUS', status: 'connecting' });
+    clearTimeout(startingTimer);
+    startingTimer = setTimeout(() => { starting = false; }, 90000);
+
+    const Baileys = await loadBaileys();
+    const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, isJidNewsletter, isLidUser, proto } = Baileys;
+    _proto = proto;
+
+    // Reload settings in case they changed while we were disconnected
+    refreshSettings();
+
+    // Restore the durable recovery cache (media that arrived before the last
+    // restart is still recoverable — WhatsApp keeps it on the sender's device).
+    try { _recoveryCache.load(); } catch (e) { console.error('[RecoveryCache] load failed:', e.message); }
+
+    // Fetch latest WA Web version to avoid 405 (client_too_old) rejection.
+    // Hard 15s cap — a hanging fetch must not stall connection startup.
+    let waVersion;
+    try {
+        const result = await Promise.race([
+            Baileys.fetchLatestWaWebVersion(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('version fetch timed out after 15s')), 15000))
+        ]);
+        waVersion = result.version;
+        console.log(`[Worker:${userId}] WA Web version: ${waVersion ? waVersion.join('.') : 'using default'}`);
+    } catch (e) {
+        console.warn(`[Worker:${userId}] Failed to fetch WA Web version, using default: ${e.message}`);
+    }
+
+    // Cancel any pending reconnect
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    // Clean up old socket if hanging
+    if (currentSocket) {
+        try { currentSocket.ev?.removeAllListeners(); } catch {}
+        try { currentSocket.ws?.close(); } catch {}
+        currentSocket = null;
+    }
+
+        // Prune session bloat — app-state-sync keys + stale pre-keys/sessions accumulate forever
+        try {
+            const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+            const prekeyCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+            const files = fs.readdirSync(sessionDir);
+            // (audit L17) Pre-key cap must be deterministic: sort by mtime and
+            // keep the newest 1000. The old nested condition deleted on
+            // count>2000 regardless of age and never on 1000<count<=2000, so
+            // the two thresholds contradicted each other and stale pre-keys
+            // piled up until decryption failures.
+            const prekeys = [];
+            for (const f of files) {
+                if (f.startsWith('pre-key-')) {
+                    try { prekeys.push({ f, mtime: fs.statSync(path.join(sessionDir, f)).mtimeMs }); } catch {}
+                }
+            }
+            if (prekeys.length > 1000) {
+                prekeys.sort((a, b) => a.mtime - b.mtime); // oldest first
+                for (let i = 0; i < prekeys.length - 1000; i++) {
+                    try { fs.rmSync(path.join(sessionDir, prekeys[i].f)); } catch {}
+                }
+            }
+            for (const f of files) {
+                const isAppState = f.startsWith('app-state-sync-key-');
+                const isPreKey = f.startsWith('pre-key-');
+                const isSession = f.startsWith('session-');
+                if (!isAppState && !isPreKey && !isSession) continue;
+                try {
+                    const fp = path.join(sessionDir, f);
+                    const st = fs.statSync(fp);
+                    if (isAppState && st.mtimeMs < cutoff) fs.rmSync(fp);
+                    else if (!isAppState && st.mtimeMs < prekeyCutoff) fs.rmSync(fp);
+                } catch {}
+            }
+        // LID cache cleanup — prevent unbounded growth (also cleaned on set, but periodic full prune)
+        if (_lidPnCache.size > 500) {
+            const toDelete = _lidPnCache.size - 500;
+            let i=0;
+            for (const k of _lidPnCache.keys()) {
+                if (i++ >= toDelete) break;
+                _lidPnCache.delete(k);
+            }
+        }
+    } catch {}
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+    // Detect if we have an existing session (previously logged in)
+    hasSession = hasSession || !!state.creds?.me?.id;
+
+    const sockOptions = {
+        // Keep receive/decryption failures visible; a live socket alone does
+        // not mean incoming statuses are reaching the automation handlers.
+        logger: process.env.BAILEYS_PRESENCE_DIAGNOSTICS === '1'
+            ? P({ level: 'trace' }, require('./lib/presence-diagnostics')(process.stderr))
+            : P({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' }, process.stderr),
+        auth: state,
+        agent: connectAgent,
+        browser: Browsers.ubuntu('Chrome'),
+        mobile: false,
+        markOnlineOnConnect: userSettings.presence === 'online',
+        syncFullHistory: false,
+        defaultQueryTimeoutMs: 60000,
+        connectTimeoutMs: 60000,
+        // Raised from 15000 -> 60000. Baileys closes the socket itself
+        // (DisconnectReason.connectionLost / 408) when no WS message is
+        // received within keepAliveIntervalMs+5000. A 15s interval makes that
+        // threshold only 20s — any brief network stall on the VPS<->WA path trips
+        // it and self-closes the connection. 60000 raises the tolerance to 65s
+        // (still far below any ~90s NAT idle timeout, and pings remain frequent
+        // enough to keep the socket alive), absorbing transient stalls without
+        // a full reconnect cycle.
+        keepAliveIntervalMs: 60000,
+        maxRetries: 5,
+        qrTimeout: 120000
+    };
+    // IMPORTANT: never pass `version: undefined` — makeWASocket merges the
+    // config over DEFAULT_CONNECTION_CONFIG, so an explicit undefined wipes
+    // the default and crashes registration ("Cannot read properties of
+    // undefined (reading 'join')"), killing every session-less account.
+    if (Array.isArray(waVersion)) sockOptions.version = waVersion;
+
+    const sock = makeWASocket(sockOptions);
+    require('./lib/creds-presence-guard')(sock, state);
+    require('./lib/status-ack')(sock, console.log,
+        require('./lib/status-content')(sock, Baileys, sockOptions.logger, console.log));
+    sock.ws.on('CB:ib,,offline_preview', (node) => {
+        const preview = node.content?.find?.(child => child.tag === 'offline_preview');
+        console.log('[Connection] Offline queue preview:', preview?.attrs || node.attrs);
+        const pending = Number(preview?.attrs?.count);
+        // rc14 requests only 100 items, even when the server advertises a
+        // larger backlog. Ask for the advertised queue so live delivery can
+        // resume; cap each request to avoid an unbounded reconnect burst.
+        if (Number.isSafeInteger(pending) && pending > 100) {
+            const count = Math.min(pending, 5000);
+            sock.sendNode({ tag: 'ib', attrs: {}, content: [
+                { tag: 'offline_batch', attrs: { count: String(count) } }
+            ] }).then(() => console.log(`[Connection] Requested offline backlog: ${count}`))
+                .catch(err => console.error('[Connection] Offline backlog request failed:', err.message));
+        }
+    });
+    sock.ws.on('CB:ib,,offline', () => {
+        console.log('[Connection] Offline queue completed');
+    });
+
+    sock.ev.on('creds.update', () => {
+        try { saveCreds(); } catch (e) { console.error('Failed to save creds:', e.message); }
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            sendToParent({ type: 'QR', qr });
+            if (pendingPhoneNumber && !hasSession && !sock.authState?.creds?.registered) {
+                triggerPairingCode(sock, pendingPhoneNumber);
+            }
+        } else if (connection === 'connecting') {
+            sendToParent({ type: 'STATUS', status: 'connecting' });
+        }
+
+        if (connection === 'close') {
+            isPairingCodeRequested = false;
+            clearTimeout(startingTimer);
+            startingTimer = null;
+            clearPresence();
+            lastChatJid = null; // don't poke a pre-reconnect chat as 'typing'
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = (statusCode !== DisconnectReason.loggedOut);
+            
+            sendToParent({ type: 'STATUS', status: 'offline' });
+            let errData = 'none';
+            try { errData = lastDisconnect?.error?.data ? JSON.stringify(lastDisconnect.error.data) : 'none'; } catch {}
+            console.log(`Disconnect: ${lastDisconnect?.error?.message || 'unknown'}, code: ${statusCode}, data: ${errData}`);
+            
+            // Detect rate-limit (405/429) vs other errors
+            const isRateLimited = statusCode === 405 || statusCode === 429;
+            if (isRateLimited) {
+                sendToParent({ type: 'ERROR', code: 405, message: 'WhatsApp rejected the connection. This may be a temporary IP block.' });
+            }
+            
+            currentSocket = null;
+            
+            if (shouldReconnect && retryCount < MAX_RETRIES) {
+                retryCount++;
+                let base;
+                if (isRateLimited) {
+                    base = Math.min(RATE_LIMIT_DELAY * Math.pow(1.5, retryCount - 1), 120000);
+                } else if (!hasSession) {
+                    // No session yet (QR not scanned) — longer delay between QR retries
+                    base = Math.min(QR_RETRY_DELAY * retryCount, 60000);
+                } else {
+                    // Was connected before — shorter backoff for network issues
+                    base = Math.min(BASE_DELAY * Math.pow(2, retryCount - 1), 30000);
+                }
+                const jitter = 0.75 + Math.random() * 0.5;
+                const delay = Math.round(base * jitter);
+                console.log(`Connection lost. Reconnecting in ${delay/1000}s (attempt ${retryCount}/${MAX_RETRIES})...`);
+                starting = false;
+                reconnectTimer = setTimeout(start, delay);
+            } else if (shouldReconnect) {
+                console.log(`Max retries (${MAX_RETRIES}) reached.${isRateLimited ? ' Rate-limit suspected. Waiting 2min before final retry...' : ' Clearing session for fresh re-link.'}`);
+                if (isRateLimited) {
+                    if (!global._rateLimitCycles) global._rateLimitCycles = 0;
+                    global._rateLimitCycles++;
+                    if (global._rateLimitCycles > 3) {
+                        console.log('Rate-limited after 3 cycles. Giving up.');
+                        sendToParent({ type: 'LOGGED_OUT' });
+                        process.exit(1);
+                    }
+                    retryCount = 0;
+                    starting = false;
+                    reconnectTimer = setTimeout(start, 120000);
+                } else if (!hasSession) {
+                    // Only wipe the session when there was never a valid
+                    // login — a long outage with a valid session must NOT
+                    // force the owner to re-link.
+                    try {
+                        const files = fs.readdirSync(sessionDir);
+                        for (const f of files) {
+                            fs.rmSync(path.join(sessionDir, f), { recursive: true, force: true });
+                        }
+                    } catch (e) {
+                        console.error('Failed to clear session:', e.message);
+                    }
+                    process.exit(1);
+                } else {
+                    // Transient server/network close with a VALID session
+                    // (428 "in favor of incoming prekey bundle" / 408 from a
+                    // dropped WA WebSocket). Caused by host/WA, not auth
+                    // failure. Do NOT exit: a new process issues a new prekey
+                    // bundle that WA 428s the dropped session for, amplifying
+                    // the disconnect loop and churning the worker every ~11 min
+                    // (each refork ~ MAX_RETRIES*~45s). Back off and keep
+                    // reconnecting in-process at a throttled interval instead.
+                    console.log(`Max retries reached on transient disconnect (${statusCode}) — backing off 30s and continuing.`);
+                    starting = false;
+                    reconnectTimer = setTimeout(start, 30000);
+                }
+            } else {
+                console.log('Logged out. Clearing session for fresh re-link.');
+                try {
+                    const files = fs.readdirSync(sessionDir);
+                    for (const f of files) {
+                        fs.rmSync(path.join(sessionDir, f), { recursive: true, force: true });
+                    }
+                } catch (e) {
+                    console.error('Failed to clear session:', e.message);
+                }
+                sendToParent({ type: 'LOGGED_OUT' });
+                process.exit(0);
+            }
+        } else if (connection === 'open') {
+            clearTimeout(startingTimer);
+            startingTimer = null;
+            starting = false;
+            retryCount = 0;
+            hasSession = true;
+            pendingPhoneNumber = null;
+            isPairingCodeRequested = false;
+            global._rateLimitCycles = 0;
+            sendToParent({ type: 'STATUS', status: 'online' });
+            console.log(`[Connection] Online at ${new Date().toISOString()}`);
+            // Apply configured presence (none/online/typing/recording)
+            applyPresence(sock);
+
+            // Catch up on active statuses loaded from the recovery cache
+            if (userSettings.autostatus !== false && _recoveryCache) {
+                setTimeout(async () => {
+                    try {
+                        const now = Date.now();
+                        for (const s of _recoveryCache.statuses.values()) {
+                            if (s && s.key && s.key.remoteJid === 'status@broadcast') {
+                                const ageMs = now - (s.ts || 0);
+                                if (ageMs <= 24 * 60 * 60 * 1000) {
+                                    await markStatusAsViewed(sock, s).catch(() => {});
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.error('[Status] Cache replay error:', e.message);
+                    }
+                }, 3000);
+            }
+            // Fetch profile picture — use the REAL phone jid, not sock.user.id
+            // (which is the LID on these accounts and returns no picture)
+            try {
+                const selfJid = state.creds?.me?.id ? jidNormalizedUser(state.creds.me.id) : (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
+                // Expose the real PN jid to the dot-command engine (.save/.vv
+                // destination) — sock.user.id alone is a LID on these accounts.
+                if (state.creds?.me?.id) _ownerJid = jidNormalizedUser(state.creds.me.id);
+                sendToParent({
+                    type: 'ACCOUNT_INFO',
+                    phone: selfJid ? selfJid.split('@')[0] : (sock.user?.id ? jidNormalizedUser(sock.user.id).split('@')[0] : null),
+                    name: state.creds?.me?.name || sock.user?.name || null
+                });
+                if (selfJid) {
+                    const ppUrl = await sock.profilePictureUrl(selfJid, 'image');
+                    sendToParent({ type: 'PP_URL', url: ppUrl });
+                }
+            } catch (e) { /* ignore if no PP */ }
+        }
+    });
+
+    currentSocket = sock;
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        try {
+        // A restored session can hold a stale Signal session for a contact
+        // (their phone advanced the ratchet while the bot was down). Their
+        // messages then fail decryption with Bad MAC forever: rc14's
+        // auto-session-recreation only recreates when it thinks there is
+        // NO session, so a corrupt-but-present session blocks the fix.
+        // The CIPHERTEXT stub arrives BOTH as 'notify' (live) AND as
+        // 'append' (offline batch right after reconnect — the most common
+        // case), and libsignal converts per-session "Bad MAC" errors into
+        // `SessionError("No matching sessions found for message")` before
+        // the stub is built — so match that string too.
+        const healCheck = (m) => {
+            const stubParams = m.messageStubParameters || [];
+            return m.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT
+                && stubParams.some(p => /No matching sessions|Bad MAC/i.test(p));
+        };
+        for (const m of messages) {
+            if (m.key?.remoteJid === 'status@broadcast' && !m.message) {
+                console.warn('[Status] Undecoded delivery:', {
+                    id: m.key.id, type, stubType: m.messageStubType,
+                    reason: m.messageStubParameters
+                });
+            }
+            if (!healCheck(m)) continue;
+            const healJid = require('./lib/session-heal')(m.key);
+            if (!healJid) continue;
+            if (healedSessions.has(healJid)) continue;
+            healedSessions.add(healJid);
+            // Bounded like the other caches: long-running bots see many jids.
+            if (healedSessions.size > 500) healedSessions.delete(healedSessions.values().next().value);
+            try {
+                const sessionId = sock.signalRepository.jidToSignalProtocolAddress(healJid);
+                await state.keys.set({ session: { [sessionId]: null } });
+                console.log(`[SessionHeal] Deleted stale Signal session for ${healJid} (Bad MAC).`);
+                console.log(`[SessionHeal] Fresh key exchange forced with ${healJid}.`);
+            } catch (e) { console.error('[SessionHeal] Failed:', e.message); }
+        }
+        // History sync normally gets dropped. Baileys delivers messages sent
+        // from the linked phone as fresh `append` events, though, including
+        // owner dot-commands. But `append` is the whole OFFLINE batch, not
+        // just history sync — dropping all but fromMe commands blinded
+        // anti-delete exactly when it matters most (a delete that happens
+        // while we're down arrives here). Keep: fresh fromMe commands, recent
+        // messages (statuses/replies/reactions still work after reconnect),
+        // and revocation notices up to 6h old. Drop the rest of the history
+        // flood and cap the batch so a huge backlog can't be re-processed.
+        if (type === 'prepend' || type === 'replace') return;
+        if (type === 'append') {
+            const nowSec = Math.floor(Date.now() / 1000);
+            const ageOf = (m) => {
+                const ts = typeof m.messageTimestamp?.toNumber === 'function' ? m.messageTimestamp.toNumber() : Number(m.messageTimestamp || 0);
+                return ts > 0 ? Math.abs(nowSec - ts) : Infinity;
+            };
+            const statusMsgs = messages.filter(m => m.key?.remoteJid === 'status@broadcast' && ageOf(m) <= 24 * 60 * 60);
+            const otherMsgs = messages.filter(m => {
+                if (!m.key || m.key.remoteJid === 'status@broadcast') return false;
+                const text = (() => { const c = unwrapContent(m.message) || {}; return (c.conversation || c.extendedTextMessage?.text || '').trim(); })();
+                const pfx = userSettings.commandPrefix || '.';
+                const hasPfx = text.startsWith(pfx) ? pfx : (text.startsWith('.') ? '.' : null);
+                if (m.key.fromMe === true && hasPfx && text.length > hasPfx.length && ageOf(m) <= 120) return true;
+                // protocolMessage type 0 (REVOKE) = revocation notice — the anti-delete
+                // payoff of an offline batch.
+                if (m.message?.protocolMessage && (m.message.protocolMessage.type === 0 || m.message.protocolMessage.type === 'REVOKE')) return ageOf(m) <= 6 * 60 * 60;
+                return ageOf(m) <= 15 * 60;
+            }).slice(-100);
+            messages = [...statusMsgs, ...otherMsgs];
+            if (messages.length === 0) return;
+        }
+        // Single 3s head start per batch — the first reply waits, the rest
+        // of a burst don't stack extra delays
+        let delayDone = false;
+        for (const m of messages) {
+            // One bad message must not abort the whole batch (revokes, statuses
+            // and replies in the rest of this batch are all dropped by a throw)
+            try {
+            if (!m.key || !m.message) continue;
+            const rawMessage = m.message;
+            // Unwrap ephemeral/view-once/edited envelopes ONCE here (audit M11)
+            // so every downstream text/caption read sees the real content.
+            m.message = unwrapContent(m.message);
+            const jid = m.key.remoteJid;
+            if (!jid) continue;
+
+            // Auto View-Once Reveal (antivv): automatically reveal incoming view-once media to owner
+            if (userSettings.antivv && !m.key.fromMe && jid !== 'status@broadcast') {
+                try {
+                    // Detection must happen on the RAW message: the worker
+                    // unwrapped the envelopes above, so the view-once wrapper
+                    // is only visible in rawMessage. Cover every wrapper
+                    // WhatsApp uses (incl. ephemeral wrapping a view-once) and
+                    // the media-level `viewOnce` flag.
+                    const VO_WRAPPERS = ['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'];
+                    const findVo = (msg, depth = 0) => {
+                        if (!msg || depth > 4) return null;
+                        for (const w of VO_WRAPPERS) {
+                            if (msg[w]?.message) return msg[w].message;
+                        }
+                        if (msg.ephemeralMessage?.message) return findVo(msg.ephemeralMessage.message, depth + 1);
+                        if (msg.documentWithCaptionMessage?.message) return findVo(msg.documentWithCaptionMessage.message, depth + 1);
+                        return null;
+                    };
+                    const vo = findVo(rawMessage);
+                    const isViewOnceFlag = !!(m.message?.imageMessage?.viewOnce || m.message?.videoMessage?.viewOnce || m.message?.audioMessage?.viewOnce);
+                    // Baileys rc14 sets key.isViewOnce on the decoded message
+                    // (see decode-wa-message.js) — the most reliable signal.
+                    const keySaysViewOnce = m.key?.isViewOnce === true;
+                    if (vo || isViewOnceFlag || keySaysViewOnce) {
+                        const innerVo = vo ? (unwrapContent(vo) || vo) : (m.message || {});
+                        const mediaTypes = ['imageMessage', 'videoMessage', 'audioMessage'];
+                        const vType = mediaTypes.find(t => innerVo[t]);
+                        if (vType) {
+                            const ownerJid = _ownerJid || (state.creds?.me?.id ? jidNormalizedUser(state.creds.me.id) : null);
+                            if (ownerJid) {
+                                const Baileys = await loadBaileys();
+                                const { downloadMediaToFile } = require('./lib/media');
+                                let file;
+                                try {
+                                    // Same resilient path as `.vv`: supports
+                                    // directPath-only media, re-requests the
+                                    // media from the sender's device on 404/410,
+                                    // and streams to disk (no giant Buffer).
+                                    file = await downloadMediaToFile(sock, Baileys, {
+                                        key: m.key,
+                                        media: innerVo[vType],
+                                        protoKey: vType,
+                                        timeoutMs: 20000
+                                    });
+                                } catch (e) {
+                                    console.error('[AntiVV] Failed to download view-once media:', e.message);
+                                }
+                                if (file) {
+                                    const senderRaw = m.key.participant || jid || '';
+                                    const senderPn = await resolveAuthorJid(sock, m.key).catch(()=>null);
+                                    const senderNum = (senderPn || senderRaw || '').split('@')[0] || 'unknown';
+                                    const chatLabel = jid.endsWith('@g.us') ? `Group ${jid.split('@')[0]}` : 'DM';
+                                    const attr = `Auto View-Once from ${senderNum} (${chatLabel})`;
+                                    const media = innerVo[vType];
+                                    try {
+                                        if (vType === 'imageMessage') await sock.sendMessage(ownerJid, { image: { url: file.path }, caption: media?.caption ? `${attr}\n\n${media.caption}` : attr });
+                                        else if (vType === 'videoMessage') await sock.sendMessage(ownerJid, { video: { url: file.path }, caption: media?.caption ? `${attr}\n\n${media.caption}` : attr });
+                                        else if (vType === 'audioMessage') {
+                                            await sock.sendMessage(ownerJid, { audio: { url: file.path }, mimetype: media?.mimetype || 'audio/mpeg', ptt: !!media?.ptt });
+                                            await sock.sendMessage(ownerJid, { text: attr });
+                                        }
+                                        console.log(`[AntiVV] Revealed view-once from ${senderNum} in ${jid} to owner ${ownerJid.split('@')[0]}`);
+                                    } catch (err) {
+                                        console.error(`[AntiVV] Send error to ${ownerJid}:`, err.message);
+                                    } finally {
+                                        if (file?.cleanup) file.cleanup();
+                                    }
+                                }
+                            } else {
+                                console.error('[AntiVV] No owner or admin JID available');
+                            }
+                        }
+                    }
+                } catch (e) { console.error('[AntiVV] auto-reveal error:', e.message, e.stack); }
+            }
+            
+            // Skip newsletter/channel messages entirely
+            const msgParticipant = m.key.participant;
+            if (isJidNewsletter(jid) || (msgParticipant && isJidNewsletter(msgParticipant))) continue;
+
+            // Track the most recent 1:1 chat as a target for typing/recording presence
+            if (!jid.endsWith('@g.us') && jid !== 'status@broadcast' && !m.key.fromMe) {
+                console.log(`[Msg] from ${(m.key.participant || jid).split('@')[0]}${m.key.fromMe ? ' (fromMe)' : ''}: ${(m.message.conversation || m.message.extendedTextMessage?.text || '').slice(0, 40)}`);
+                lastChatJid = jid;
+                // Wait 3s before marking the chat active (typing/recording) so the
+                // owner's phone has time to show the notification first. Single
+                // pending poke — new messages just reschedule it.
+                if (pokeTimer) clearTimeout(pokeTimer);
+                pokeTimer = setTimeout(() => {
+                    pokeTimer = null;
+                    if (currentSocket) pokePresence(currentSocket);
+                }, 3000);
+                if (pokeTimer.unref) pokeTimer.unref();
+            }
+
+            // Anti-Delete: Save messages to the store. Statuses go in their
+            // OWN store — they flood constantly (WhatsApp re-delivers unviewed
+            // statuses with fresh ids) and would otherwise crowd out real chats.
+            const isRevokeMsg = !!(m.message?.protocolMessage && (m.message.protocolMessage.type === 0 || m.message.protocolMessage.type === 'REVOKE'));
+            const isReactionMsg = !!m.message?.reactionMessage;
+
+            if (jid === 'status@broadcast') {
+                if (!isRevokeMsg && !isReactionMsg) {
+                    console.log(`[Status] Stanza received from ${(m.key.participant || 'unknown').split('@')[0]} (id: ${m.key.id}${m.key.fromMe ? ', own' : ''})`);
+                    // ALWAYS store — .save needs this even when anti-delete-status
+                    // is off (only the delete ALERT is gated, in the revoke handler).
+                    _statusMsgStore.set(m.key.id, m);
+                    _recoveryCache.putStatus(m.key.id, m.message, m.key);
+                    if (_statusMsgStore.size > 200) _statusMsgStore.delete(_statusMsgStore.keys().next().value);
+                }
+            } else if (!m.key.fromMe && !isRevokeMsg && !isReactionMsg) {
+                // Store ALWAYS — .vv needs the original message when the
+                // quoted stub ships without a usable media url. (Anti-delete
+                // recovery reads the same cache; storing unconditionally is
+                // harmless when the feature is off.)
+                _msgStore.set(m.key.id, m);
+                _recoveryCache.putMessage(m.key.id, m.message, m.key);
+                if (_msgStore.size > 100) _msgStore.delete(_msgStore.keys().next().value);
+            }
+
+            // 1. Anti-Delete (Detect Revoke)
+            const msgType = Object.keys(m.message)[0];
+            if (!msgType) continue;
+            // Check the field directly: group messages can carry
+            // senderKeyDistributionMessage before protocolMessage, in which
+            // case first-key detection missed every revoke.
+            if (isRevokeMsg) {
+                const protoKey = m.message.protocolMessage.key || {};
+                const targetId = protoKey.id;
+                // Revokes for statuses come with the original status key, but fallback to checking status store
+                let isStatus = protoKey.remoteJid === 'status@broadcast' || jid === 'status@broadcast';
+                if (!isStatus && targetId && _statusStoreFacade.has(targetId)) {
+                    isStatus = true;
+                }
+                const adEnabled = isStatus ? (userSettings.antideleteStatus !== false) : (userSettings.antideleteMsg !== false);
+                if (adEnabled && targetId) {
+                    // A single delete is re-delivered several times by WhatsApp —
+                    // the deleted original also keeps re-delivering and re-fills the
+                    // store, so WITHOUT this, one delete spams N alerts.
+                    // (audit L16) The id is marked up front to suppress those
+                    // re-deliveries, but the mark is ROLLED BACK when nothing was
+                    // actually alerted (original not in the store yet) so a later
+                    // re-delivery — after the original syncs — can still alert once.
+                    if (!_revokedIds.has(targetId)) {
+                        _revokedIds.add(targetId);
+                        if (_revokedIds.size > 300) _revokedIds.delete(_revokedIds.values().next().value);
+                        // Look through the facades (memory first, durable cache
+                        // second) — after a restart the original message only
+                        // exists in the on-disk cache, and the recovery would
+                        // silently fail.
+                        let oldMsg = isStatus ? _statusStoreFacade.get(targetId) : _msgStoreFacade.get(targetId);
+                        if (!oldMsg && !isStatus && _statusStoreFacade.has(targetId)) {
+                            isStatus = true;
+                            oldMsg = _statusStoreFacade.get(targetId);
+                        }
+                        if (!oldMsg && isStatus && _msgStoreFacade.has(targetId)) {
+                            isStatus = false;
+                            oldMsg = _msgStoreFacade.get(targetId);
+                        }
+
+                        if (!(oldMsg && oldMsg.key && oldMsg.message)) {
+                            console.log(`[Anti-Delete] Revocation received for uncached ${isStatus ? 'status' : 'message'} (id: ${targetId})`);
+                            _revokedIds.delete(targetId);
+                        } else {
+                            // LID authors resolve to their real phone number via
+                            // Baileys' LID mapping store (participantPn/senderPn
+                            // are NOT populated on regular message keys)
+                            const authorJid = await resolveAuthorJid(sock, oldMsg.key);
+                            const displayJid = authorJid || oldMsg.key.participant || oldMsg.key.remoteJid || 'sender';
+                            if (isStatus) {
+                                // Same status is re-delivered with fresh ids then
+                                // revoked repeatedly — dedup by author+content
+                                const sig = (oldMsg.key.participant || '') + '|' + msgSignature(oldMsg);
+                                const last = _alertedStatus.get(sig);
+                                if (last && Date.now() - last < STATUS_ALERT_TTL) {
+                                    console.log(`[Anti-Delete] Suppressed duplicate status alert (${displayJid.split('@')[0]})`);
+                                    _statusMsgStore.delete(targetId);
+                                    _msgStore.delete(targetId);
+                                    continue;
+                                }
+                                _alertedStatus.set(sig, Date.now());
+                                if (_alertedStatus.size > 300) _alertedStatus.delete(_alertedStatus.keys().next().value);
+                            }
+
+                            // Route strictly to the bot owner's DM (never forwarded to another number).
+                            // sock.user.id is the LID on these accounts — messages sent to the LID are silently
+                            // dropped and never appear in the owner's DM.
+                            const ownerJid = _ownerJid || (state.creds?.me?.id ? jidNormalizedUser(state.creds.me.id) : null);
+                            if (!ownerJid) continue;
+                            
+                            console.log(`[Anti-Delete] Detected deleted ${isStatus ? 'status' : 'message'} from ${displayJid} (routing to owner ${ownerJid.split('@')[0]})`);
+
+                            // Recover content once
+                            let recovered = null;
+                            try {
+                                recovered = await prepareRecoveredContent(sock, oldMsg, displayJid, isStatus);
+                            } catch (e) {
+                                console.error('[Anti-Delete] Content recovery preparation error:', e?.stack || e);
+                            }
+
+                            try {
+                                const alert = { 
+                                    text: `🛡️ *Anti-Delete Detected*\n\n*From:* @${displayJid.split('@')[0]}${isStatus ? '\n*Type:* Deleted status' : ''}\n*Message:*`,
+                                    mentions: [displayJid]
+                                };
+                                await sock.sendMessage(ownerJid, alert, !isStatus && oldMsg ? { quoted: oldMsg } : undefined);
+                            } catch (e) {
+                                console.error(`[Anti-Delete] Alert error to ${ownerJid}:`, e?.message || e);
+                            }
+                            if (recovered?.msg) {
+                                try {
+                                    await sock.sendMessage(ownerJid, recovered.msg);
+                                } catch (e) {
+                                    console.error(`[Anti-Delete] Forward error to ${ownerJid}:`, e?.message || e);
+                                }
+                            } else if (recovered?.raw) {
+                                try {
+                                    await copyNForward(sock, ownerJid, recovered.raw);
+                                } catch (e) {
+                                    console.error(`[Anti-Delete] Raw forward error to ${ownerJid}:`, e?.message || e);
+                                }
+                            }
+                            if (recovered?.cleanup) recovered.cleanup();
+                        }
+                    }
+                }
+                if (isStatus) _statusMsgStore.delete(targetId);
+                _msgStore.delete(targetId);
+                continue;
+            }
+
+            // 1b. Anti-Link (3 strikes: warn, then remove)
+            // Anti-Link is a GROUP-ADMIN tool: it only runs when the account
+            // has group-admin features enabled AND anti-link is switched on.
+            if (jid.endsWith('@g.us') && userSettings.antilink && userSettings.groupAdmin && !m.key.fromMe) {
+                const txt = m.message.conversation || m.message.extendedTextMessage?.text || m.message.imageMessage?.caption || m.message.videoMessage?.caption || m.message.documentMessage?.caption || '';
+                const isLink = /(https?:\/\/|www\.|chat\.whatsapp\.com|t\.me|discord\.gg|youtube\.com|youtu\.be|instagram\.com|facebook\.com|tiktok\.com|bit\.ly|tinyurl|wa\.me|\b\w+\.(com|net|org|io|gh|info)\b)/i.test(txt);
+                if (isLink) {
+                    try {
+                        const metaAL = await sock.groupMetadata(jid).catch(()=>null);
+                        const senderAL = m.key.participant;
+                        const senderOpJid = await resolveAuthorJid(sock, m.key) || senderAL;
+                        const senderNumAL = (senderOpJid || '').split('@')[0].replace(/\D/g, '');
+                        const adminListAL = Array.isArray(userSettings.admins) ? userSettings.admins : [];
+                        const isBotAdminSender = m.key.fromMe || adminListAL.some(n => {
+                            const clean = String(n || '').replace(/\D/g, '');
+                            return clean && (clean === senderNumAL || (clean.length >= 6 && senderNumAL.endsWith(clean)));
+                        });
+                        if (isBotAdminSender) {
+                            if (isLink) console.log(`[AntiLink] Exempting bot owner/admin ${senderNumAL} from link check`);
+                            continue;
+                        }
+                        const botIds = [sock.user?.id, sock.user?.lid, state.creds?.me?.id].filter(Boolean).map(j=>jidNormalizedUser(j));
+                        const isSenderAdminAL = metaAL?.participants.find(p=> jidNormalizedUser(p.id) === jidNormalizedUser(senderAL) || (isLidUser(senderAL) && p.lid && jidNormalizedUser(p.lid)===jidNormalizedUser(senderAL)) )?.admin;
+                        const isBotAdminAL = metaAL?.participants.find(p=> botIds.includes(jidNormalizedUser(p.id)) || (p.lid && botIds.includes(jidNormalizedUser(p.lid))) )?.admin;
+                        // debug log for dogbyte
+                        if (isLink) console.log(`[AntiLink] check jid=${jid} sender=${senderAL} isSenderAdmin=${!!isSenderAdminAL} isBotAdmin=${!!isBotAdminAL} botIds=${botIds.join(',')}`);
+                        if (!isSenderAdminAL && isBotAdminAL) {
+                            await sock.sendMessage(jid, {delete: m.key});
+                            const wKey = `${jid}:${senderAL}`;
+                            const wCount = (antilinkWarns.get(wKey) || 0) + 1;
+                            antilinkWarns.set(wKey, wCount);
+                            setTimeout(()=> antilinkWarns.delete(wKey), 24*60*60*1000).unref?.();
+                            // Mention with the sender's REAL phone jid — a LID
+                            // mention renders as raw digits, not the contact name
+                            const mentionAL = senderOpJid;
+                            if (wCount === 1) {
+                                // Warn ONCE. Further links are deleted silently —
+                                // repeat warnings just feed the troll.
+                                await sock.sendMessage(jid, {text: `@${mentionAL.split('@')[0]} links not allowed`, mentions: [mentionAL]});
+                                console.log(`[AntiLink] Warned ${mentionAL.split('@')[0]} in ${jid} (1st link)`);
+                            } else if (wCount >= 3) {
+                                await sock.groupParticipantsUpdate(jid, [senderOpJid], 'remove');
+                                console.log(`[AntiLink] Removed ${senderOpJid.split('@')[0]} in ${jid} (3rd link)`);
+                                antilinkWarns.delete(wKey);
+                            }
+                        }
+                    } catch(e){ console.error('[AntiLink] error', e.message) }
+                }
+            }
+
+            // 1c. Group Admin Tools (dot commands, reply/tag/number all work, gated by groupAdmin toggle)
+            const rawTxtGA = m.message.conversation || m.message.extendedTextMessage?.text || '';
+            const pfx = userSettings.commandPrefix || '.';
+            const hasAntiLinkCmd = new RegExp('^\\' + pfx + 'antilink\\b', 'i').test(rawTxtGA.trim()) || /^\.antilink\b/i.test(rawTxtGA.trim());
+            if (jid.endsWith('@g.us') && (userSettings.groupAdmin || hasAntiLinkCmd)) {
+                const rawTxt = rawTxtGA;
+                const txt = rawTxt.trim();
+                const hasPfx = txt.startsWith(pfx) ? pfx : (txt.startsWith('.') ? '.' : null);
+                if (hasPfx) {
+                    const args = txt.slice(hasPfx.length).split(/\s+/);
+                    const cmd = args[0].toLowerCase();
+                    const groupCmds = new Set(['promote','demote','kick','remove','add','mute','unmute','invite','tagall','hidetag','antilink','requests','approve','reject','ephemeral','joinmode','addmode','desc','revoke','leave','rules']);
+                    if (groupCmds.has(cmd)) {
+                        const ctx = m.message.extendedTextMessage?.contextInfo || {};
+                        const getTarget = () => {
+                            if (ctx.participant) return jidNormalizedUser(ctx.participant);
+                            if (ctx.mentionedJid?.[0]) return jidNormalizedUser(ctx.mentionedJid[0]);
+                            const num = args[1]?.replace(/[^0-9]/g,''); if (num && num.length>=8) return num + '@s.whatsapp.net';
+                            return null;
+                        };
+                        const target = getTarget();
+                        let handledGA = false;
+                        try {
+                            const metaGA = await sock.groupMetadata(jid).catch(()=>null);
+                            if (!metaGA) continue; // this message failed — don't drop the rest of the batch
+                            const senderGA = m.key.participant;
+                            const botIdsGA = [sock.user?.id, sock.user?.lid, state.creds?.me?.id].filter(Boolean).map(j=>jidNormalizedUser(j));
+                            const isSenderAdminGA = metaGA?.participants.find(p=> jidNormalizedUser(p.id)===jidNormalizedUser(senderGA) || (isLidUser(senderGA) && p.lid && jidNormalizedUser(p.lid)===jidNormalizedUser(senderGA)) )?.admin;
+                            const isBotAdminGA = metaGA?.participants.find(p=> botIdsGA.includes(jidNormalizedUser(p.id)) || (p.lid && botIdsGA.includes(jidNormalizedUser(p.lid))) )?.admin;
+                            // Mention the target's REAL phone jid (prefer the group
+                            // roster's pn entry) so @mentions show names, not digits
+                            const targetPnGA = target ? ((metaGA.participants.find(p=> jidNormalizedUser(p.id)===target || (p.lid && jidNormalizedUser(p.lid)===target)) || {}).id || target) : target;
+                            const targetOpJid = targetPnGA || target;
+                            // Sender or bot lacks group admin rights — don't swallow
+                            // the message. Fall through to the owner command engine
+                            // below (4.5), which re-checks authorization itself. The
+                            // old `continue` here killed owner commands (.antilink,
+                            // .tagall, .kick) whenever the owner's phone wasn't in
+                            // the group's admin roster.
+                            if (isSenderAdminGA && isBotAdminGA) {
+                            if (cmd==='promote' && target) { await sock.groupParticipantsUpdate(jid, [targetOpJid], 'promote'); await sock.sendMessage(jid, {text: `✅ Promoted @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
+                            else if (cmd==='demote' && target) { await sock.groupParticipantsUpdate(jid, [targetOpJid], 'demote'); await sock.sendMessage(jid, {text: `✅ Demoted @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
+                            else if ((cmd==='kick'||cmd==='remove') && target) { await sock.groupParticipantsUpdate(jid, [targetOpJid], 'remove'); await sock.sendMessage(jid, {text: `✅ Removed @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
+                            else if (cmd==='add' && target) { await sock.groupParticipantsUpdate(jid, [targetOpJid], 'add'); await sock.sendMessage(jid, {text: `✅ Added @${targetPnGA.split('@')[0]}`, mentions:[targetPnGA]}); }
+                            else if (cmd==='mute') { await sock.groupSettingUpdate(jid, 'announcement'); await sock.sendMessage(jid, {text: '🔒 Group muted (announcement)'}); }
+                            else if (cmd==='unmute') { await sock.groupSettingUpdate(jid, 'not_announcement'); await sock.sendMessage(jid, {text: '🔓 Group unmuted'}); }
+                            else if (cmd==='invite') { const code=await sock.groupInviteCode(jid); await sock.sendMessage(jid, {text: `https://chat.whatsapp.com/${code}`}); }
+                            else if (cmd==='tagall') { const txtAll=metaGA.participants.map(p=>'@'+p.id.split('@')[0]).join(' '); await sock.sendMessage(jid, {text: txtAll, mentions: metaGA.participants.map(p=>p.id)}); }
+                            else if (cmd==='hidetag' && args.slice(1).join(' ').trim()) { const txtH=args.slice(1).join(' '); await sock.sendMessage(jid, {text: txtH, mentions: metaGA.participants.map(p=>p.id)}); }
+                            else if (cmd==='antilink') {
+                                const sub=args[1]?.toLowerCase();
+                                if (sub==='on') { userSettings.antilink=true; sendToParent({ type: 'UPDATE_SETTINGS', changes: { antilink: true } }); await sock.sendMessage(jid,{text:'🔗 Anti-Link ON'});  }
+                                else if (sub==='off') { userSettings.antilink=false; sendToParent({ type: 'UPDATE_SETTINGS', changes: { antilink: false } }); await sock.sendMessage(jid,{text:'🔗 Anti-Link OFF'});  }
+                                else await sock.sendMessage(jid,{text:'Usage: .antilink on/off (also dashboard toggle)'});
+                            }
+                            else if (cmd==='requests') {
+                                const pending = await sock.groupRequestParticipantsList(jid).catch(() => []);
+                                if (!pending.length) { await sock.sendMessage(jid, { text: '✅ No pending join requests.' }); }
+                                else {
+                                    const lines = pending.slice(0, 20).map(r => `• ${(r.jid||'').split('@')[0]}`).join('\n');
+                                    await sock.sendMessage(jid, { text: `📥 *Pending join requests* (${pending.length})\n\n${lines}\n\nUse .approve <number> or .reject <number>` });
+                                }
+                            }
+                            else if (cmd==='approve' || cmd==='reject') {
+                                const num = (args[1]||'').replace(/\D/g,'');
+                                if (!num) { await sock.sendMessage(jid, { text: `Usage: .${cmd} <number>` }); }
+                                else {
+                                    const target = num.includes('@') ? num : `${num}@s.whatsapp.net`;
+                                    const res = await sock.groupRequestParticipantsUpdate(jid, [target], cmd === 'approve' ? 'approve' : 'reject').catch(e => { throw e; });
+                                    const ok = Array.isArray(res) && res.some(r => r.status === '200');
+                                    await sock.sendMessage(jid, { text: ok ? `✅ ${cmd === 'approve' ? 'Approved' : 'Rejected'} @${num}` : `⚠️ ${cmd === 'approve' ? 'Approval' : 'Rejection'} failed for @${num}` });
+                                }
+                            }
+                            else if (cmd==='ephemeral') {
+                                const sub = (args[1]||'').toLowerCase();
+                                const map = { off: 0, '1': 86400, '24h': 86400, '7d': 604800, '90d': 7776000 };
+                                const secs = map[sub];
+                                if (secs === undefined) { await sock.sendMessage(jid, { text: 'Usage: .ephemeral off | 24h | 7d | 90d' }); }
+                                else {
+                                    await sock.groupToggleEphemeral(jid, secs);
+                                    await sock.sendMessage(jid, { text: secs ? `🕶 Disappearing messages: ${sub}` : '🕶 Disappearing messages: off' });
+                                }
+                            }
+                            else if (cmd==='joinmode') {
+                                const sub = (args[1]||'').toLowerCase();
+                                if (sub !== 'on' && sub !== 'off') { await sock.sendMessage(jid, { text: 'Usage: .joinmode on | off  (on = join requests need approval)' }); }
+                                else {
+                                    await sock.groupJoinApprovalMode(jid, sub === 'on' ? 'on' : 'off');
+                                    await sock.sendMessage(jid, { text: sub === 'on' ? '🔐 Join requests now need approval.' : '🔓 Anyone with the link can join.' });
+                                }
+                            }
+                            else if (cmd==='addmode') {
+                                const sub = (args[1]||'').toLowerCase();
+                                if (sub !== 'on' && sub !== 'off') { await sock.sendMessage(jid, { text: 'Usage: .addmode on | off  (on = only admins can add members)' }); }
+                                else {
+                                    await sock.groupMemberAddMode(jid, sub === 'on' ? 'admin_add' : 'all_member_add');
+                                    await sock.sendMessage(jid, { text: sub === 'on' ? '👥 Only admins can add members.' : '👥 Everyone can add members.' });
+                                }
+                            }
+                            else if (cmd==='desc') {
+                                const text = args.slice(1).join(' ').trim();
+                                if (!text) { await sock.sendMessage(jid, { text: 'Usage: .desc <group description>' }); }
+                                else {
+                                    await sock.groupUpdateDescription(jid, text);
+                                    await sock.sendMessage(jid, { text: '📝 Group description updated.' });
+                                }
+                            }
+                            else if (cmd==='revoke') {
+                                await sock.groupRevokeInvite(jid);
+                                await sock.sendMessage(jid, { text: '🔁 Invite link revoked — the old link no longer works.' });
+                            }
+                            else if (cmd==='leave') {
+                                // Say goodbye BEFORE leaving — after groupLeave()
+                                // the bot is no longer in the chat and the
+                                // message would fail to send.
+                                await sock.sendMessage(jid, { text: '👋 Leaving this group.' });
+                                await sock.groupLeave(jid);
+                                continue;
+                            }
+                            else if (cmd==='rules') {
+                                const meta = metaGA;
+                                const admins = (meta.participants||[]).filter(p=>p.admin).map(p=>(p.id||'').split('@')[0]);
+                                await sock.sendMessage(jid, { text: `📋 *${meta.subject}*\n\nMembers: ${meta.participants?.length||0}\nAdmins: ${admins.join(', ')||'—'}\n${meta.desc ? `\n${meta.desc}` : ''}` });
+                            }
+                            handledGA = true;
+                            } // end admin-gated group command chain
+                        } catch(e){ console.error('[GroupAdmin] error', e.stack||e); }
+                        // Only the admin-gated chain above consumes the command.
+                        // When the sender or the bot lacks group-admin rights the
+                        // message must fall through to the owner command engine
+                        // (4.5) — the old unconditional `continue` made .kick,
+                        // .tagall, .antilink ... dead for an owner who is not a
+                        // group admin himself.
+                        if (handledGA) continue;
+                    }
+                }
+            }
+
+            // 2. Auto View Status — EVERY delivery is viewed, even duplicates
+            //    (WhatsApp re-delivers unviewed statuses with fresh ids)
+            //    Never skip the read when the author can't be resolved — skipping
+            //    is what makes the status stay unviewed and re-deliver forever
+            //    (an unbounded CPU loop on flood days).
+            if (jid === 'status@broadcast' && require('./lib/status-post')(m.message) && userSettings.autostatus !== false) {
+                await markStatusAsViewed(sock, m);
+            }
+
+            // 3. Auto React Status — EVERY delivery gets a reaction, even duplicates
+            if (jid === 'status@broadcast' && require('./lib/status-post')(m.message) && !m.key.fromMe && userSettings.statusReact !== false) {
+                const statusId = m.key.id;
+                const selfJid = sock.authState?.creds?.me?.id ? jidNormalizedUser(sock.authState.creds.me.id) : (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
+                const selfLid = sock.authState?.creds?.me?.lid ? jidNormalizedUser(sock.authState.creds.me.lid) : (sock.user?.lid ? jidNormalizedUser(sock.user.lid) : null);
+                const participant = m.key.participant || m.participant || (m.key.fromMe ? (selfLid || selfJid) : null);
+                if (!m.key.participant && participant) m.key.participant = participant;
+                const reactSig = (participant || '') + '|' + msgSignature(m);
+                if (_reactedStatus.has(reactSig) && Date.now() - _reactedStatus.get(reactSig) < STATUS_REACT_TTL) continue;
+
+                let emojis = [];
+                if (Array.isArray(userSettings.reactEmojis)) {
+                    emojis = userSettings.reactEmojis.filter(Boolean);
+                } else if (typeof userSettings.reactEmojis === 'string') {
+                    emojis = userSettings.reactEmojis.split(/[\s,]+/).filter(Boolean);
+                }
+                if (!emojis.length) emojis = ['❤️', '🖤', '💚', '🤍', '💙', '🩷', '🩵'];
+                const randomEmoji = emojis[Math.floor(Math.random() * emojis.length)];
+
+                try { 
+                    // WhatsApp requires the status to be registered as viewed first,
+                    // otherwise the reaction is silently rejected.
+                    const authorJid = await resolveAuthorJid(sock, m.key).catch(() => null) || (m.key.fromMe ? selfJid : null);
+                    const participantsToAck = Array.from(new Set([authorJid, participant].filter(Boolean)));
+                    for (const p of participantsToAck) {
+                        try {
+                            if (typeof sock.sendReceipt === 'function') {
+                                await sock.sendReceipt('status@broadcast', p, [statusId], 'read');
+                            }
+                        } catch (e) {}
+                    }
+
+                    // Throttle bursts: only wait out the 800ms if the previous
+                    // react in this batch already did (batch-wide, not per-status)
+                    const elapsed = Date.now() - lastReactAt;
+                    if (elapsed < 800) await new Promise(r => setTimeout(r, 800 - elapsed));
+                    lastReactAt = Date.now();
+
+                    if (participant) {
+                        const reactionId = await require('./lib/status-reaction')(
+                            sock, Baileys, { ...m.key, participant }, randomEmoji
+                        );
+                        _reactedStatus.set(reactSig, Date.now());
+                        if (_reactedStatus.size > 300) _reactedStatus.delete(_reactedStatus.keys().next().value);
+                        console.log(`[Status] Reaction accepted by WhatsApp: ${randomEmoji}, status=${statusId}, reaction=${reactionId}`);
+                    }
+                } catch (e) {
+                    console.error('[Status] React Error:', e?.message || e);
+                }
+            }
+
+            // 3b. Anti-Tag Status — detect statuses that tag groups.
+            // Independent of groupAdmin: the dashboard presents it as its own
+            // toggle, and the old groupAdmin !== false condition made it dead
+            // unless Group Admin Tools was also switched on.
+            if (jid === 'status@broadcast' && userSettings.antiTagStatus === true) {
+                const ctxInfo = m.message.extendedTextMessage?.contextInfo || m.message.imageMessage?.contextInfo || m.message.videoMessage?.contextInfo || {};
+                const mentionedJid = ctxInfo.mentionedJid || [];
+                const groupMentions = ctxInfo.groupMentions || [];
+                const text = m.message.conversation || m.message.extendedTextMessage?.text || m.message.imageMessage?.caption || m.message.videoMessage?.caption || '';
+                const hasGroupTag = mentionedJid.some(j => String(j).endsWith('@g.us')) ||
+                    groupMentions.some(g => String(g.groupJid || g.jid || '').endsWith('@g.us')) ||
+                    /@\s*(all|everyone|group)/i.test(text);
+                if (hasGroupTag) {
+                    const senderJid = (await resolveAuthorJid(sock, m.key)) || m.key.participant || m.key.remoteJid;
+                    // Status revokes target someone ELSE's status update — WhatsApp
+                    // rejects those (we don't own the message), so the old delete
+                    // call was a guaranteed failure. Log it; no fake action.
+                    console.log(`[Anti-Tag] Status with group tag detected from ${senderJid?.split('@')[0] || 'unknown'} (statuses cannot be revoked by the bot)`);
+                    try {
+                        const senderNum = (senderJid || 'unknown').split('@')[0];
+                        const alertText = `⚠️ *Anti-Tag Status Alert*\n\nGroup tag detected in status broadcast from @${senderNum}.${text ? `\n\nContent: "${text.slice(0, 120)}"` : ''}`;
+                        const ownerJid = _ownerJid || (state.creds?.me?.id ? jidNormalizedUser(state.creds.me.id) : null);
+                        if (ownerJid) {
+                            await sock.sendMessage(ownerJid, { text: alertText, mentions: senderJid ? [senderJid] : [] }).catch(() => {});
+                        }
+                    } catch (e) {
+                        console.error('[Anti-Tag] Alert error:', e.message);
+                    }
+                    continue;
+                }
+            }
+
+            // 4. Skip Auto-Reply for all status broadcasts
+            if (jid === 'status@broadcast') continue;
+
+            // 4.5 Bot commands (prefix or ".") — owner (linked phone) or listed
+            // admins. Ported from the GitHub version; runs after the group
+            // admin block above so group tools keep priority in groups.
+            {
+                const cmdText = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').trim();
+                const pfx = userSettings.commandPrefix || '.';
+                const hasCmdPfx = cmdText.startsWith(pfx) ? pfx : (cmdText.startsWith('.') ? '.' : null);
+                if (hasCmdPfx && cmdText.length > hasCmdPfx.length) {
+                    console.log(`[Cmd] ${m.key.fromMe ? 'owner' : 'remote'} ${cmdText.split(/\s+/)[0]} in ${jid}`);
+                    await handleOwnerCommand(sock, cmdText, m, jid);
+                    continue;
+                }
+            }
+
+            // 5. Auto-Reply (master switch) — ChatAI toggle gates the AI replies below
+            if (!m.key.fromMe && userSettings.autoreply === true) {
+                const msgText = m.message.conversation || 
+                              m.message.extendedTextMessage?.text || 
+                              m.message.imageMessage?.caption || 
+                              m.message.videoMessage?.caption || 
+                              m.message.documentMessage?.caption || "";
+
+                // Voice notes: no text → transcribe, then let the AI reply.
+                // Allow/block gates FIRST (managed via .allow / .block dot
+                // commands). Block always wins; empty allow = reply to everyone.
+                // Gating before the voice block saves a download+transcription
+                // for senders who would be skipped anyway.
+                const gateNum = (n) => String(n || '').replace(/\D/g, '').replace(/^00233/, '').replace(/^233/, '').replace(/^0/, '');
+                // Resolve LID jids to the real phone number BEFORE list matching —
+                // allow/block hold phone numbers, and on LID accounts the DM jid /
+                // group participant is a @lid whose digits match nothing.
+                const rawSender = (jid.endsWith('@g.us') || jid === 'status@broadcast') ? (m.key?.participant || '') : (m.key?.remoteJid || jid);
+                const resolvedSender = await resolveAuthorJid(sock, m.key) || rawSender;
+                const senderNum = String(resolvedSender).split('@')[0];
+                const allowList = Array.isArray(userSettings.allow) ? userSettings.allow : [];
+                const blockList = Array.isArray(userSettings.block) ? userSettings.block : [];
+                const gateAllowed = !blockList.some(n => gateNum(n) && gateNum(n) === gateNum(senderNum)) &&
+                    !(allowList.length > 0 && !allowList.some(n => gateNum(n) === gateNum(senderNum)));
+
+                // Only real voice notes (ptt), only DMs. Media download retries:
+                // WhatsApp frequently serves the media URL before it's usable.
+                let voiceText = "";
+                if (userSettings.voiceNotes !== false && gateAllowed && !msgText.trim() && !jid.endsWith('@g.us') && m.message.audioMessage?.ptt === true && (m.message.audioMessage?.url || m.message.audioMessage?.directPath)) {
+                    try {
+                        if (!require('./lib/notification-presence')(userSettings.presence)) {
+                            await sock.sendPresenceUpdate('recording', jid).catch(() => {});
+                        }
+                        const { downloadContentFromMessage } = await loadBaileys();
+                        let buf = null;
+                        for (let attempt = 1; attempt <= 3 && !buf; attempt++) {
+                            try {
+                                const stream = await downloadContentFromMessage(m.message.audioMessage, 'audio');
+                                const chunks = [];
+                                for await (const ch of stream) chunks.push(ch);
+                                const b = Buffer.concat(chunks);
+                                if (b.length) buf = b;
+                            } catch (e) {
+                                if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 1500));
+                                else console.error('[AutoReply] Voice download failed after 3 attempts:', e.message);
+                            }
+                        }
+                        if (buf) {
+                            voiceText = await transcribeVoice(buf, m.message.audioMessage.mimetype || 'audio/ogg');
+                            console.log(`[AutoReply] Voice from ${(m.key.participant || jid).split('@')[0]}: "${voiceText.slice(0, 80)}"`);
+                        }
+                    } catch (e) {
+                        console.error('[AutoReply] Voice transcribe error:', e.message);
+                    }
+                }
+                const chatInput = (msgText.trim() || voiceText);
+
+                if (!gateAllowed) continue;
+
+                if (chatInput) {
+                    const isGroup = jid.endsWith('@g.us');
+                    // The bot's identity: real phone jid (sock.user.id is the LID
+                    // on these accounts — mentions of the real number would never
+                    // match and group auto-reply would stay silent)
+                    const botId = jidNormalizedUser(state.creds?.me?.id || sock.user?.id || '');
+                    const botNumber = botId.split('@')[0];
+                    const botLid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : null;
+                    const mentioned = m.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
+                    const botMentioned = mentioned.some(j => {
+                        const n = jidNormalizedUser(j);
+                        return n === botId || (botLid && n === botLid) || n.split('@')[0] === botNumber;
+                    });
+                    const numberInText = botNumber && new RegExp('(?:^|\\s|@)' + botNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:$|\\s)').test(msgText);
+                    const isMentioned = botMentioned || numberInText;
+
+                    // Skip group messages unless group AI is enabled AND bot is mentioned
+                    if (isGroup && (!userSettings.groupChatAI || !isMentioned)) continue;
+
+                    // Basic AI reply cooldown to reduce spam/loops
+                    const aiCooldownKey = isGroup ? `${jid}:${m.key.participant || senderNum || ''}` : jid;
+                    const nowTs = Date.now();
+                    const lastTs = aiReplyCooldown.get(aiCooldownKey) || 0;
+                    if (nowTs - lastTs < AI_REPLY_COOLDOWN_MS) continue;
+
+                    // 3s head start so the owner's phone notification can show
+                    // before the bot reads the chat and replies
+                    if (!delayDone) {
+                        await new Promise(r => setTimeout(r, 3000));
+                        delayDone = true;
+                    }
+
+                    let groqTimeout = null;
+                    try {
+                        // Presence pokes are cosmetic — a failure here must not
+                        // abort the whole AI reply
+                        if (!require('./lib/notification-presence')(userSettings.presence)) {
+                            try { await sock.sendPresenceUpdate('composing', jid); } catch (e) {}
+                        }
+
+                        const reply = await Promise.race([
+                            askGroq(jid, chatInput, m.pushName, {
+                                botName: (userSettings.botName || '').trim() || sock.user?.name || 'Alex',
+                                instructions: userSettings.botInstructions,
+                                participant: m.key.participant
+                            }),
+                            new Promise((_, reject) => {
+                                groqTimeout = setTimeout(() => reject(new Error('Groq timeout')), 30000);
+                            })
+                        ]);
+                        if (reply) {
+                            const replyOpts = { text: reply };
+                            if (isGroup) {
+                                // @mention with the real number — a LID participant
+                                // in the mention list silently fails to tag anyone
+                                const senderPn = await resolveAuthorJid(sock, m.key);
+                                replyOpts.mentions = [senderPn || m.key.participant || jid];
+                            }
+                            await sock.sendMessage(jid, replyOpts, { quoted: m });
+                            aiReplyCooldown.set(aiCooldownKey, Date.now());
+                            console.log(`[AutoReply] Replied to ${m.pushName || jid} in ${isGroup ? 'Group' : 'Private'}`);
+                        }
+                    } catch (err) {
+                        console.error('[AutoReply] Error:', err.message);
+                    } finally {
+                        if (groqTimeout) clearTimeout(groqTimeout);
+                        try { await sock.sendPresenceUpdate('paused', jid); } catch (e) {}
+                    }
+                }
+            }
+            } catch (err) {
+                console.error('[Msg] Error:', err.message);
+            }
+        }
+        } catch (err) {
+            console.error('[Upsert] Unhandled error:', err.message);
+        }
+    });
+
+    sock.ev.on('messaging-history.set', async ({ messages: histMsgs }) => {
+        if (!Array.isArray(histMsgs) || userSettings.autostatus === false) return;
+        for (const m of histMsgs) {
+            if (m.key?.remoteJid === 'status@broadcast') {
+                try {
+                    _statusMsgStore.set(m.key.id, m);
+                    _recoveryCache.putStatus(m.key.id, m.message, m.key);
+                    await markStatusAsViewed(sock, m);
+                } catch (e) {}
+            }
+        }
+    });
+
+    sock.ev.on('call', async (calls) => {
+        if (userSettings.anticall !== true) return;
+        for (const call of calls) {
+            if (call.status !== 'offer' || call.fromMe || call.offline) continue;
+            try {
+                const caller = call.callerPn || call.callerJid?.split('@')[0] || call.from?.split('@')[0] || 'Unknown';
+                const callerNum = String(caller).replace(/\D/g, '');
+                const adminList = Array.isArray(userSettings.admins) ? userSettings.admins : [];
+                const isWhitelisted = adminList.some(n => {
+                    const clean = String(n || '').replace(/\D/g, '');
+                    return clean && (clean === callerNum || (clean.length >= 6 && callerNum.endsWith(clean)));
+                });
+                if (isWhitelisted) {
+                    console.log(`[AntiCall] Allowing call from whitelisted admin ${caller}`);
+                    continue;
+                }
+                await sock.rejectCall(call.id, call.from);
+                console.log(`[AntiCall] Rejected call from ${caller}${call.isGroup ? ' (group)' : ''}`);
+            } catch (e) {
+                console.error('[AntiCall] Reject error:', e.message);
+            }
+        }
+    });
+}
+
+process.on('disconnect', () => {
+    // Exit cleanly (code 0) — a parent disconnect is NOT a crash. Exiting non-zero
+    // would trip the manager's crash-loop counter and risk a session wipe after
+    // rapid pm2 restarts.
+    console.error('[Worker] Parent disconnected, exiting.');
+    if (currentSocket) {
+        try { currentSocket.ws?.close(); } catch {}
+    }
+    process.exit(0);
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[Worker] Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[Worker] Uncaught Exception:', err);
+    // Tell the manager this is a CODE crash, not a session problem — the
+    // manager must never wipe a linked session because of a bug.
+    try { process.send({ type: 'CRASH', kind: 'code', message: err && err.message ? err.message : String(err) }); } catch {}
+    // Exit so the manager's crash tracking + restart logic takes over —
+    // a half-dead worker that keeps "running" is worse than a clean crash.
+    process.exit(1);
+});
+
+function shutdownWorker() {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    clearPresence();
+    // Persist the recovery cache before exiting so a restart does not lose
+    // the media metadata `.vv` / anti-delete depend on.
+    try { _recoveryCache.flush(); } catch (e) { console.error('[RecoveryCache] flush failed:', e.message); }
+    if (currentSocket) {
+        // Close the connection WITHOUT logging out — the session stays valid
+        // so the next start reconnects without needing a new QR scan.
+        try { currentSocket.ws?.close(); } catch {}
+        try { currentSocket.ev?.removeAllListeners(); } catch {}
+    }
+    process.exit(0);
+}
+process.on('SIGTERM', () => {
+    console.log('Stopping worker...');
+    shutdownWorker();
+});
+process.on('SIGINT', () => {
+    shutdownWorker();
+});
+
+// AV_NO_AUTOSTART=1 loads the module without connecting — used by the boot
+// smoke test to catch module-evaluation errors (e.g. a temporal-dead-zone
+// ReferenceError) without touching WhatsApp.
+if (process.env.AV_NO_AUTOSTART !== '1') {
+    start().catch(err => {
+        console.error('Worker startup failed:', err.message);
+        // A startup failure is a CODE problem, not a session problem. The
+        // manager must not wipe the linked session because of it.
+        try { process.send({ type: 'CRASH', kind: 'startup', message: err.message }); } catch {}
+        process.exit(1);
+    });
+}
+

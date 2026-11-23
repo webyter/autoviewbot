@@ -1,0 +1,132 @@
+{
+  "generatedAt": "2026-11-23T00:48:52.184Z",
+  "verdict": "All five confirmed code defects fixed and regression-verified. The missing-encryption-key limitation for some view-once media remains.",
+  "scope": [
+    "Main manager and worker",
+    "Command engine and aliases",
+    "Media, status and notification helpers",
+    "Authentication/session/API boundaries",
+    "Database and backup handling",
+    "Frontend and deployment configuration",
+    "halcyon-worker subproject"
+  ],
+  "checks": {
+    "mainRegression": {
+      "passed": 222,
+      "failed": 0
+    },
+    "halcyonRegression": {
+      "passed": 8,
+      "failed": 0
+    },
+    "syntax": {
+      "files": 59,
+      "failures": []
+    },
+    "dependencyAudit": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 0,
+      "critical": 0,
+      "total": 0
+    },
+    "commandAudit": {
+      "distinctCommands": 69,
+      "summary": {
+        "mock pass": 80
+      }
+    },
+    "runtime": {
+      "readiness": "ok",
+      "observedActiveWorkers": 1
+    },
+    "productionWorkerIsolation": "Live production worker PID 635937 survived the full suite before the intentional deployment restart."
+  },
+  "findings": [
+    {
+      "id": "AUDIT-01",
+      "severity": "high",
+      "area": "authorization",
+      "file": "lib/backup.js",
+      "line": 30,
+      "title": "Settings import accepts admin-controlled account properties",
+      "evidence": "Isolated import changed rentalExpiresAt to a caller-selected value. POST /api/backup/import requires an authenticated user but does not require admin. importUser uses a short denylist rather than an allowlist.",
+      "impact": "A user can extend their own rental period or change other account properties that should be managed by the platform admin.",
+      "recommendation": "Allowlist editable user settings and validate their types; reject rental, role, lifecycle, and account-control properties.",
+      "status": "fixed",
+      "resolution": "Validated allowlist replaces arbitrary account-property import; protected rental, role, lifecycle and secret fields cannot be changed. Invalid settings are rejected before applying changes."
+    },
+    {
+      "id": "AUDIT-02",
+      "severity": "high",
+      "area": "process lifecycle and test isolation",
+      "file": "autoviewer.js",
+      "line": 1940,
+      "title": "Starting any manager kills all matching worker processes",
+      "evidence": "Startup executes pkill -f \"bot_worker\\.js\" without a session-directory or parent-process boundary. Test suites start separate managers on isolated ports and session directories. Live logs contain worker shutdown/restart events during such test runs.",
+      "impact": "An isolated test manager or another installation can interrupt production WhatsApp workers and trigger reconnects.",
+      "recommendation": "Track and clean up only workers belonging to the same installation and session directory; avoid global process-name sweeps.",
+      "status": "fixed",
+      "resolution": "Worker cleanup checks the Node executable, exact worker script, canonical session directory, user ID and optional exact account. Global pkill sweeps removed. Production worker remained alive throughout the full isolated-manager test suite."
+    },
+    {
+      "id": "AUDIT-03",
+      "severity": "high",
+      "area": "startup and configuration",
+      "file": "lib/db.js",
+      "line": 44,
+      "title": "Admin bootstrap can throw before database queues are initialized",
+      "evidence": "With a temporary users.json containing a non-admin Alice and ADMIN_USERNAMES=alice, requiring lib/db.js exits with ReferenceError: Cannot access saveQueue before initialization.",
+      "impact": "A restart with newly configured admin promotions can fail during module initialization.",
+      "recommendation": "Initialize write queues before calling syncAdminUsers; add a startup regression test covering a newly promoted admin.",
+      "status": "fixed",
+      "resolution": "Database queues are initialized before admin bootstrap. A normal-process test verifies first-time promotion and persistence."
+    },
+    {
+      "id": "AUDIT-04",
+      "severity": "high",
+      "area": "backup and recovery",
+      "file": "scripts/backup.sh",
+      "line": 56,
+      "title": "Backup archive omits key material and application settings",
+      "evidence": "A synthetic source containing creds.json, pre-key-1.json, sender-key-1.json, recovery-cache.json and session/app_settings.json produced an archive containing only creds.json and recovery-cache.json. The script matches prekeys-*.json rather than pre-key-*.json and has no sender-key/app_settings inclusion. SESSION_DIR overrides are also ignored.",
+      "impact": "Restoration can omit encryption state and saved administrator settings; custom session-directory deployments may back up the wrong directory.",
+      "recommendation": "Back up the actual configured session directory comprehensively and verify restoration into an isolated installation.",
+      "status": "fixed",
+      "resolution": "Backup includes the complete configured session tree, follows a symlink directory, omits the live manager lock, refuses missing/nested destinations and uses a private archive. Synthetic backup/restore verifies key material, settings and login-session files."
+    },
+    {
+      "id": "AUDIT-05",
+      "severity": "medium",
+      "area": "ChatAI configuration",
+      "file": "lib/groqAI.js",
+      "line": 53,
+      "title": "Saved-only Groq keys are not read by normal app entry points",
+      "evidence": "getGroqApiKey references fs and path without importing them. A normal temporary .cjs entry with only session/app_settings.json configured reports configured=false; the exception is silently swallowed. This can be hidden by node -e, where fs/path are available as globals.",
+      "impact": "A Groq key saved through the admin interface can stop being recognized after a full manager restart when it is absent from the environment.",
+      "recommendation": "Import fs/path explicitly and test stored-key loading from a normal CommonJS entry file.",
+      "status": "fixed",
+      "resolution": "fs/path are explicitly imported. Stored-only Groq key loading is verified from a normal CommonJS process; startup key detection now uses the same resolver."
+    },
+    {
+      "id": "LIMIT-01",
+      "severity": "functional limitation",
+      "area": "view-once media",
+      "file": "lib/quoted-media.js",
+      "line": 14,
+      "title": ".vv remains unavailable for the tested messages without encryption metadata",
+      "evidence": "Live attempts had no mediaKey, URL, directPath or cached original. Both primary-phone address variants failed to return a recoverable original.",
+      "impact": "Passing media tests does not establish that .vv works for all view-once posts.",
+      "recommendation": "Document the limitation accurately; require a usable original rather than claiming recovery of absent encryption data.",
+      "status": "external limitation"
+    }
+  ],
+  "verificationLimits": [
+    "Review and existing tests are not exhaustive proof of every live WhatsApp command.",
+    "Actual payment processing and every group moderation action were not exercised.",
+    "Reproductions used temporary fixtures; no credentials or real message content are included in this report.",
+    "Five code defects fixed and deployed; no claim that encryption metadata withheld by WhatsApp can be recovered."
+  ],
+  "updatedAt": "2026-11-23T00:56:27.887Z"
+}

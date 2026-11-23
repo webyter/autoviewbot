@@ -1,0 +1,756 @@
+{
+  "generatedAt": "2026-11-23T00:55:18.970Z",
+  "scope": "Isolated mocks; no real WhatsApp messages or group changes",
+  "summary": {
+    "mock pass": 80
+  },
+  "commands": [
+    {
+      "command": "menu",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "ping",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "clear",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "clearHistory",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "reset",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "clearHistory",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "new",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "clearHistory",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "alive",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "setting",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "settings",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "autostatus",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage",
+        "markStatusAsViewed"
+      ]
+    },
+    {
+      "command": "antidelete",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "antideletestatus",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "antitag",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "antitagstatus",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "antivv",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "avv",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "anticall",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "antilink",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "autoreply",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "groupadmin",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "chatai",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "viewstatus",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "markStatusAsViewed",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "viewstatuses",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "markStatusAsViewed",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "readstatus",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "markStatusAsViewed",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "mode",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "statusreact",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "emojis",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "reactemojis",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "prefix",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "groupai",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "groupchatai",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "voicenotes",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "vn",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "ghost",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "presence",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "allow",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "block",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "persona",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "save",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage",
+        "sendMessage",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "vv",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "media",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "poll",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "admin",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "kick",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "promote",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "demote",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "mute",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupSettingUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "unmute",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupSettingUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "tagall",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "flip",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "roll",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "pick",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "8ball",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "love",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "joke",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "quote",
+      "path": "command engine",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "promote",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "demote",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "kick",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "remove",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "add",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "mute",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupSettingUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "unmute",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupSettingUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "invite",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "tagall",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "hidetag",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "antilink",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "requests",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "approve",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupRequestParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "reject",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupRequestParticipantsUpdate",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "ephemeral",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupToggleEphemeral",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "joinmode",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupJoinApprovalMode",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "addmode",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupMemberAddMode",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "desc",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupUpdateDescription",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "revoke",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "groupRevokeInvite",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "leave",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage",
+        "groupLeave"
+      ]
+    },
+    {
+      "command": "rules",
+      "path": "worker group handler",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "antivv",
+      "path": "unauthorized public user",
+      "result": "mock pass",
+      "finding": null
+    },
+    {
+      "command": "avv",
+      "path": "unauthorized public user",
+      "result": "mock pass",
+      "finding": null
+    },
+    {
+      "command": "vv",
+      "path": "uncached expired quoted media",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "updateMediaMessage",
+        "sendMessage"
+      ]
+    },
+    {
+      "command": "media",
+      "path": "uncached expired quoted media",
+      "result": "mock pass",
+      "finding": null,
+      "actions": [
+        "updateMediaMessage",
+        "sendMessage",
+        "sendMessage"
+      ]
+    }
+  ]
+}

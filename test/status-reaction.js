@@ -1,0 +1,31 @@
+'use strict';
+const assert = require('assert');
+const {EventEmitter} = require('events');
+const send = require('../lib/status-reaction');
+const post = require('../lib/status-post');
+(async()=>{
+    const b={jidNormalizedUser:j=>j.replace(/:\d+@/,'@'),generateMessageIDV2:()=> 'reaction-test'};
+    const key={remoteJid:'status@broadcast',id:'original',participant:'200:4@lid',fromMe:false};
+    const ws=new EventEmitter(), sent=[];
+    let mode='ok';
+    const sock={ws,user:{id:'100@s.whatsapp.net'},sendMessage:async(...args)=>{
+        sent.push(args);
+        if(mode==='throw') throw new Error('disconnected');
+        if(mode!=='timeout') ws.emit('CB:ack,class:message',{attrs:{id:args[2].messageId,...(mode==='reject'?{error:'400'}:{})}});
+    }};
+    assert.strictEqual(await send(sock,b,key,'❤️'),'reaction-test');
+    assert.deepStrictEqual(sent[0][2].statusJidList,['200@lid']);
+    assert.strictEqual(sent[0][1].react.key.participant,'200@lid');
+    assert.strictEqual(sent[0][1].react.key.id,'original');
+    assert.strictEqual(ws.listenerCount('CB:ack,class:message'),0);
+    mode='reject';await assert.rejects(send(sock,b,key,'❤️'),/400/);
+    mode='timeout';await assert.rejects(send(sock,b,key,'❤️',10),/timed out/);
+    mode='throw';await assert.rejects(send(sock,b,key,'❤️'),/disconnected/);
+    assert.strictEqual(ws.listenerCount('CB:ack,class:message'),0);
+    await assert.rejects(send(sock,b,{...key,fromMe:true},'❤️'),/contact status/);
+    assert.strictEqual(post({reactionMessage:{}}),false);
+    assert.strictEqual(post({protocolMessage:{}}),false);
+    assert.strictEqual(post({imageMessage:{}}),true);
+    assert.strictEqual(post({conversation:'hello'}),true);
+    console.log('Status reactions and filtering: 14 passed');
+})().catch(e=>{console.error(e);process.exitCode=1;});

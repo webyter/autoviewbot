@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
+  <defs>
+    <!-- Background squircle emerald gradient -->
+    <linearGradient id="tile" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="45%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#044e3b"/>
+    </linearGradient>
+
+    <!-- Top glass specular highlight -->
+    <linearGradient id="glass-shine" x1="24" y1="2" x2="24" y2="20" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Primary lens rim gradient (Required by test: stroke="url(#lens)") -->
+    <linearGradient id="lens" x1="10" y1="10" x2="38" y2="38" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="40%" stop-color="#ecfdf5"/>
+      <stop offset="100%" stop-color="#6ee7b7"/>
+    </linearGradient>
+
+    <!-- Central radiant crystal pupil glow -->
+    <radialGradient id="core-glow" cx="35%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="35%" stop-color="#a7f3d0"/>
+      <stop offset="70%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#044e3b"/>
+    </radialGradient>
+
+    <!-- Ambient drop shadow for the optical barrel -->
+    <filter id="lens-shadow" x="0" y="0" width="48" height="48" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#022c22" flood-opacity="0.32"/>
+    </filter>
+  </defs>
+
+  <!-- Background Squircle Tile -->
+  <rect x="2" y="2" width="44" height="44" rx="13" fill="url(#tile)" stroke="rgba(255,255,255,0.4)" stroke-width="1.2"/>
+  <path d="M 2 16 C 2 8 8 2 16 2 L 32 2 C 40 2 46 8 46 16 C 34 18 14 18 2 16 Z" fill="url(#glass-shine)"/>
+
+  <!-- Outer Camera Focus & Calibration Barrel -->
+  <circle cx="24" cy="24" r="16.5" stroke="rgba(255,255,255,0.22)" stroke-width="1"/>
+  <!-- Cardinal Caliber Ticks (12, 3, 6, 9 o'clock) -->
+  <path d="M 24 5.5 L 24 8 M 24 40 L 24 42.5 M 5.5 24 L 8 24 M 40 24 L 42.5 24" stroke="rgba(255,255,255,0.55)" stroke-width="1.2" stroke-linecap="round"/>
+
+  <!-- Optical Lens Assembly with Depth Shadow -->
+  <g filter="url(#lens-shadow)">
+    <!-- Primary Outer Lens Ring with stroke="url(#lens)" -->
+    <circle cx="24" cy="24" r="13" stroke="url(#lens)" stroke-width="2.2" stroke-linecap="round"/>
+    <circle cx="24" cy="24" r="11.8" stroke="rgba(0,0,0,0.22)" stroke-width="0.8"/>
+
+    <!-- 6 Interlocking Curved Aperture Shutter Blades -->
+    <path d="M 36.80 24.00 A 12.8 12.8 0 0 1 30.40 35.09 Q 23.20 33.18 20.92 27.42 A 4.6 4.6 0 0 0 25.42 28.37 Q 31.55 29.29 36.80 24.00 Z" fill="rgba(6, 78, 59, 0.45)" stroke="rgba(255,255,255,0.4)" stroke-width="0.75"/>
+    <path d="M 30.40 35.09 A 12.8 12.8 0 0 1 17.60 35.09 Q 15.65 27.89 19.50 23.04 A 4.6 4.6 0 0 0 20.92 27.42 Q 23.20 33.18 30.40 35.09 Z" fill="rgba(6, 95, 70, 0.6)" stroke="rgba(255,255,255,0.4)" stroke-width="0.75"/>
+    <path d="M 17.60 35.09 A 12.8 12.8 0 0 1 11.20 24.00 Q 16.45 18.71 22.58 19.63 A 4.6 4.6 0 0 0 19.50 23.04 Q 15.65 27.89 17.60 35.09 Z" fill="rgba(6, 78, 59, 0.45)" stroke="rgba(255,255,255,0.4)" stroke-width="0.75"/>
+    <path d="M 11.20 24.00 A 12.8 12.8 0 0 1 17.60 12.91 Q 24.80 14.82 27.08 20.58 A 4.6 4.6 0 0 0 22.58 19.63 Q 16.45 18.71 11.20 24.00 Z" fill="rgba(6, 95, 70, 0.6)" stroke="rgba(255,255,255,0.4)" stroke-width="0.75"/>
+    <path d="M 17.60 12.91 A 12.8 12.8 0 0 1 30.40 12.91 Q 32.35 20.11 28.50 24.96 A 4.6 4.6 0 0 0 27.08 20.58 Q 24.80 14.82 17.60 12.91 Z" fill="rgba(6, 78, 59, 0.45)" stroke="rgba(255,255,255,0.4)" stroke-width="0.75"/>
+    <path d="M 30.40 12.91 A 12.8 12.8 0 0 1 36.80 24.00 Q 31.55 29.29 25.42 28.37 A 4.6 4.6 0 0 0 28.50 24.96 Q 32.35 20.11 30.40 12.91 Z" fill="rgba(6, 95, 70, 0.6)" stroke="rgba(255,255,255,0.4)" stroke-width="0.75"/>
+
+    <!-- Central Radiant Optical Crystal & Pupil -->
+    <circle cx="24" cy="24" r="4.6" fill="url(#core-glow)"/>
+    <circle cx="24" cy="24" r="2.7" fill="#022c22"/>
+    <circle cx="25.2" cy="22.6" r="1.1" fill="#ffffff"/>
+    <circle cx="22.8" cy="25.4" r="0.55" fill="#ffffff" opacity="0.85"/>
+  </g>
+
+  <!-- Diamond Lens Reflection Glint -->
+  <path d="M 34.5 12 L 35.3 14 L 37.3 14.8 L 35.3 15.6 L 34.5 17.6 L 33.7 15.6 L 31.7 14.8 L 33.7 14 Z" fill="#ffffff"/>
+  <circle cx="34.5" cy="14.8" r="1.8" fill="#ffffff" opacity="0.3"/>
+</svg>

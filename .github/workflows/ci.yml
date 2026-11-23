@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      # npm ci once the lockfile is regenerated (see lockfile job); until then
+      # npm install re-resolves, matching what the Dockerfile already does.
+      - run: npm install --no-audit --no-fund
+      # Full suite: HTTP smoke tests, media/download regressions, feature
+      # modules, worker boot check, rendered-page script checks, keep-alive and
+      # the Render blueprint generator.
+      - run: npm test
+      - name: Dependency audit
+        run: npm audit --omit=dev
+
+  # Regenerates package-lock.json against the manifest and commits the result.
+  # Fixes audit M13: the lock had drifted (baileys rc13 vs rc14, axios,
+  # express-rate-limit) and there is no npm in the authoring environment to
+  # regenerate it. Run manually or it fires on manifest changes.
+  lockfile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --package-lock-only --no-audit --no-fund
+      - name: Commit refreshed lockfile
+        run: |
+          if git diff --quiet package-lock.json; then
+            echo "lockfile already current"
+            exit 0
+          fi

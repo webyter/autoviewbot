@@ -1,0 +1,12 @@
+node_modules/
+.env
+config.env
+*.log
+session/
+data/users.json
+server-config.json
+
+# Production artefacts
+backups/
+*.tar.gz
+deploy/*.local

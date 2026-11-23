@@ -1,0 +1,50 @@
+[Unit]
+Description=AutoViewer WhatsApp bot manager
+Documentation=https://github.com/webyter/autoviewbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/autoviewbot
+ExecStart=/usr/bin/node /home/ubuntu/autoviewbot/autoviewer.js
+Restart=always
+RestartSec=5
+# Give the manager time to stop its workers cleanly (they flush the recovery
+# cache on SIGTERM).
+KillSignal=SIGTERM
+TimeoutStopSec=20
+KillMode=mixed
+LimitNOFILE=65535
+Environment=NODE_ENV=production
+# Everything else (TRUST_PROXY, COOKIE_SECURE, PUBLIC_URL, SESSION_SECRET, ...)
+# belongs in .env — dotenv does NOT override variables systemd already set,
+# so anything set here wins over .env. Keep this file to deployment-wide
+# settings and put per-host values in .env.
+#
+# For this plain-HTTP LAN deployment .env sets:
+#   TRUST_PROXY=0        (no reverse proxy in front -> do not trust X-Forwarded-For)
+#   COOKIE_SECURE=false  (the dashboard is served over http://)
+
+# ── Hardening ───────────────────────────────────────────────────────────────
+# The app only ever writes to its session directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/autoviewbot/session
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+'use strict';
+const assert = require('assert');
+const author = require('../lib/session-heal');
+assert.strictEqual(author({remoteJid:'status@broadcast',participant:'123:4@lid'}),'123:4@lid');
+assert.strictEqual(author({remoteJid:'123@g.us',participant:'456:2@s.whatsapp.net'}),'456:2@s.whatsapp.net');
+assert.strictEqual(author({remoteJid:'456:3@s.whatsapp.net'}),'456:3@s.whatsapp.net');
+assert.strictEqual(author({remoteJid:'status@broadcast'}),null);
+assert.strictEqual(author({remoteJid:'123@g.us'}),null);
+assert.strictEqual(author({remoteJid:'123@newsletter'}),null);
+assert.strictEqual(author(null),null);
+console.log('Signal session selection: 7 passed');
