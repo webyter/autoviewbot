@@ -1,0 +1,19 @@
+# AutoViewer - Caddy Configuration
+# Place in /etc/caddy/Caddyfile or include in your Caddy setup
+
+bot.example.com {
+    # Automatic TLS is provisioned by Caddy via Let's Encrypt / ZeroSSL
+
+    # Reverse proxy to the local AutoViewer dashboard
+    reverse_proxy 127.0.0.1:3000 {
+        # Streaming and timeout settings
+        transport http {
+            response_header_timeout 300s
+        }
+    }
+
+    # Request body limit for media uploads
+    request_body {
+        max_size 64MB
+    }
+}
