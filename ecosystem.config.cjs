@@ -12,13 +12,5 @@ module.exports = {
         DOTENV_QUIET: 'true',
       },
     },
-    {
-      name: 'halcyon-worker',
-      script: '/home/ubuntu/autoviewbot/halcyon-worker/server.mjs',
-      cwd: '/home/ubuntu/autoviewbot/halcyon-worker',
-      node_args: '--disable-warning=ExperimentalWarning --env-file=.env',
-      autorestart: true,
-      max_memory_restart: '200M',
-    },
   ],
 };
