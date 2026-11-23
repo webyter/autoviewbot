@@ -200,10 +200,10 @@ function renderLinkedAccount(account) {
   $('linked-account-phone').textContent = account?.phoneNumber
     ? `+${account.phoneNumber}`
     : 'Connected to WhatsApp';
-  if (typeof account?.profilePictureUrl === 'string') {
+  if (typeof account?.profilePictureUrl === 'string' && account.profilePictureUrl.trim()) {
     try {
-      const url = new URL(account.profilePictureUrl);
-      if (url.protocol === 'https:') profilePictureUrl = url.href;
+      const url = new URL(account.profilePictureUrl, window.location.origin);
+      if (url.protocol === 'https:' || url.protocol === 'http:') profilePictureUrl = url.href;
     } catch {}
   }
 
@@ -222,6 +222,15 @@ function renderLinkedAccount(account) {
     fallback.hidden = true;
   };
   image.onerror = () => {
+    const proxyUrl = new URL('/api/session/avatar', window.location.origin).href;
+    if (image.src !== proxyUrl) {
+      image.onerror = () => {
+        image.hidden = true;
+        fallback.hidden = false;
+      };
+      image.src = proxyUrl;
+      return;
+    }
     image.hidden = true;
     fallback.hidden = false;
   };

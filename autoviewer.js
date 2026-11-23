@@ -79,7 +79,7 @@ app.use((req, res, next) => {
     // markup from executing.
     res.setHeader('Content-Security-Policy', [
         "default-src 'self'",
-        "img-src 'self' data: blob:",
+        "img-src 'self' data: blob: https://*.whatsapp.net https://*.fbcdn.net https://pps.whatsapp.net",
         "style-src 'self' 'unsafe-inline'",
         "script-src 'self' 'unsafe-inline'",
         "connect-src 'self'",
@@ -309,6 +309,10 @@ function startUserBot(username, clearSession = false, force = false, phoneNumber
                     break;
                 case 'PP_URL':
                     inst.ppUrl = msg.url;
+                    try {
+                        const avatarFile = path.join(SESSION_BASE, username, 'avatar.url');
+                        fs.writeFileSync(avatarFile, msg.url, 'utf8');
+                    } catch (e) {}
                     break;
                 case 'ACCOUNT_INFO':
                     inst.phone = msg.phone;
@@ -495,6 +499,12 @@ function startUserBot(username, clearSession = false, force = false, phoneNumber
         child.stderr.pipe(process.stderr);
         child.stdout.resume();
 
+        let cachedPpUrl = null;
+        try {
+            const avatarFile = path.join(SESSION_BASE, username, 'avatar.url');
+            if (fs.existsSync(avatarFile)) cachedPpUrl = fs.readFileSync(avatarFile, 'utf8').trim();
+        } catch (e) {}
+
         instances.set(username, {
             child,
             status: phoneNumber ? "pairing" : "starting",
@@ -502,7 +512,7 @@ function startUserBot(username, clearSession = false, force = false, phoneNumber
             qrDataUrl: null,
             pairingCode: null,
             phoneNumber: phoneNumber || null,
-            ppUrl: null,
+            ppUrl: cachedPpUrl,
             errorMsg: null
         });
 

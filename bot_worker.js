@@ -950,10 +950,27 @@ async function start() {
                     name: state.creds?.me?.name || sock.user?.name || null
                 });
                 if (selfJid) {
-                    const ppUrl = await sock.profilePictureUrl(selfJid, 'image');
-                    sendToParent({ type: 'PP_URL', url: ppUrl });
+                    let ppUrl = null;
+                    try {
+                        ppUrl = await sock.profilePictureUrl(selfJid, 'image');
+                    } catch {
+                        try {
+                            ppUrl = await sock.profilePictureUrl(selfJid, 'preview');
+                        } catch {}
+                    }
+                    if (!ppUrl && state.creds?.me?.lid) {
+                        try {
+                            ppUrl = await sock.profilePictureUrl(jidNormalizedUser(state.creds.me.lid), 'preview');
+                        } catch {}
+                    }
+                    if (ppUrl) {
+                        console.log(`[Worker] Profile picture URL obtained: ${ppUrl.substring(0, 45)}...`);
+                        sendToParent({ type: 'PP_URL', url: ppUrl });
+                    }
                 }
-            } catch (e) { /* ignore if no PP */ }
+            } catch (e) {
+                console.warn('[Worker] Profile picture fetch error:', e.message);
+            }
         }
     });
 
