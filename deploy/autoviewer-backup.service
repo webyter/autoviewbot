@@ -1,0 +1,12 @@
+[Unit]
+Description=AutoViewer Daily Backup
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/autoviewbot
+ExecStart=/home/ubuntu/autoviewbot/scripts/backup.sh /home/ubuntu/autoviewbot/backups
+StandardOutput=journal
+StandardError=journal
